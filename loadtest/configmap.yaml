@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: k6-script
+  namespace: iocheck
+data:
+  # NOTE: the Makefile keeps this in sync with loadtest/script.js via
+  #   kubectl create configmap k6-script --from-file=script.js ...
+  # This file is a placeholder so the manifest path resolves.
+  script.js: ""

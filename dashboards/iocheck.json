@@ -1,0 +1,196 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "showPoints": "never" },
+          "min": 0
+        }
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "id": 1,
+      "title": "Replica count",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "kube_deployment_status_replicas{namespace=\"iocheck\",deployment=\"iocheck\"}",
+          "legendFormat": "running",
+          "refId": "A"
+        },
+        {
+          "expr": "kube_horizontalpodautoscaler_status_desired_replicas{namespace=\"iocheck\"}",
+          "legendFormat": "desired (HPA)",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "showPoints": "never" },
+          "min": 0,
+          "unit": "reqps"
+        }
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "id": 2,
+      "title": "RPS per pod  (KEDA target: 100)",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "sum(rate(http_requests_total{service=\"iocheck\"}[1m])) / scalar(kube_deployment_status_replicas_ready{namespace=\"iocheck\",deployment=\"iocheck\"} > 0)",
+          "legendFormat": "rps/pod",
+          "refId": "A"
+        },
+        {
+          "expr": "100",
+          "legendFormat": "target",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "showPoints": "never" },
+          "min": 0,
+          "unit": "s",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 0.2 }
+            ]
+          }
+        }
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "id": 3,
+      "title": "Latency (target p99 < 200ms)",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(http_request_duration_seconds_bucket{service=\"iocheck\",route=\"/lookup\"}[1m])))",
+          "legendFormat": "p99",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket{service=\"iocheck\",route=\"/lookup\"}[1m])))",
+          "legendFormat": "p95",
+          "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(http_request_duration_seconds_bucket{service=\"iocheck\",route=\"/lookup\"}[1m])))",
+          "legendFormat": "p50",
+          "refId": "C"
+        }
+      ]
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "showPoints": "never" },
+          "min": 0,
+          "unit": "percent",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 70 }
+            ]
+          }
+        }
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "id": 4,
+      "title": "CPU utilization  (CPU HPA target: 70%)",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "100 * sum(rate(container_cpu_usage_seconds_total{namespace=\"iocheck\",container=\"iocheck\"}[1m])) / sum(kube_pod_container_resource_requests{namespace=\"iocheck\",container=\"iocheck\",resource=\"cpu\"})",
+          "legendFormat": "% of request",
+          "refId": "A"
+        },
+        {
+          "expr": "70",
+          "legendFormat": "HPA threshold",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "showPoints": "never" },
+          "min": 0
+        }
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "id": 5,
+      "title": "In-flight requests per pod",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "avg(iocheck_inflight_requests{service=\"iocheck\"})",
+          "legendFormat": "avg in-flight",
+          "refId": "A"
+        },
+        {
+          "expr": "max(iocheck_inflight_requests{service=\"iocheck\"})",
+          "legendFormat": "max in-flight",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "showPoints": "never" },
+          "min": 0,
+          "max": 1,
+          "unit": "percentunit"
+        }
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "id": 6,
+      "title": "Cache hit rate",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "sum(rate(cache_lookups_total{service=\"iocheck\",result=\"hit\"}[1m])) / sum(rate(cache_lookups_total{service=\"iocheck\"}[1m]))",
+          "legendFormat": "hit rate",
+          "refId": "A"
+        }
+      ]
+    }
+  ],
+  "refresh": "5s",
+  "schemaVersion": 39,
+  "tags": ["iocheck"],
+  "templating": { "list": [] },
+  "time": { "from": "now-15m", "to": "now" },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "iocheck",
+  "uid": "iocheck",
+  "version": 1
+}

@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: iocheck-config
+  namespace: iocheck
+data:
+  PORT: "3000"
+  DATABASE_URL: "postgres://iocheck:iocheckdev@postgres.iocheck.svc.cluster.local:5432/iocheck"
+  REDIS_URL: "redis://redis.iocheck.svc.cluster.local:6379"
+  # Pool size per pod. With max 10 pods and Postgres max_connections=200,
+  # 10 * 10 = 100 conns, well under the cap.
+  PG_POOL_MAX: "10"
+  # Time the pod stays "ready" while draining so kube-proxy can de-register.
+  SHUTDOWN_GRACE_MS: "5000"

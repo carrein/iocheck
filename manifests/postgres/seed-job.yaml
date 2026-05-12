@@ -1,0 +1,41 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: iocheck-seed
+  namespace: iocheck
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels: { app: iocheck-seed }
+    spec:
+      restartPolicy: OnFailure
+      initContainers:
+        - name: wait-for-pg
+          image: postgres:17-alpine
+          command:
+            - sh
+            - -c
+            - |
+              echo "waiting for postgres.iocheck.svc..."
+              until pg_isready -h postgres.iocheck.svc -U iocheck -d iocheck; do
+                sleep 1
+              done
+              echo "postgres is ready"
+      containers:
+        - name: seed
+          image: iocheck:dev
+          imagePullPolicy: IfNotPresent
+          command: ["bun", "run", "scripts/seed.ts"]
+          env:
+            # PGPASSWORD must come before DATABASE_URL so $(PGPASSWORD)
+            # substitution resolves at pod create-time (Kubernetes only
+            # substitutes from variables defined earlier in this list).
+            - name: PGPASSWORD
+              valueFrom: { secretKeyRef: { name: postgres-secret, key: POSTGRES_PASSWORD } }
+            - name: DATABASE_URL
+              value: postgres://iocheck:$(PGPASSWORD)@postgres.iocheck.svc:5432/iocheck
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { memory: 256Mi }

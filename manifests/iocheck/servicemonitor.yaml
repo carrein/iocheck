@@ -1,0 +1,18 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: iocheck
+  namespace: iocheck
+  labels:
+    # kube-prometheus's Prometheus CR matches on this label by default.
+    release: prometheus
+spec:
+  selector:
+    matchLabels: { app: iocheck }
+  endpoints:
+    - port: http
+      path: /metrics
+      # 10s for snappy scaling response on burst; baseline 15s is too slow
+      # for a 60s ramp.
+      interval: 10s
+      scrapeTimeout: 5s

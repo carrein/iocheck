@@ -1,0 +1,31 @@
+# Merge patch (kubectl patch --type=merge --patch-file=...) applied on top
+# of kube-prometheus's Prometheus CR. Only the spec fields below are touched;
+# everything else (podMetadata, securityContext, image, etc.) is left intact
+# so the prometheus-operator can populate Service selectors correctly.
+#
+# Why each field:
+#   enableRemoteWriteReceiver  → so k6 --out experimental-prometheus-rw can
+#                                push test metrics. Prometheus 3.x still
+#                                requires this explicitly despite the docs.
+#   retention                  → 6h on a kind cluster fits a 30-min demo
+#                                without ballooning disk.
+#   replicas                   → 1 for the demo; HA Prometheus is out of scope.
+#   resources                  → enough for ~10 service replicas + node/kube
+#                                state metrics on a laptop.
+spec:
+  enableRemoteWriteReceiver: true
+  retention: 6h
+  replicas: 1
+  resources:
+    requests:
+      cpu: 100m
+      memory: 400Mi
+    limits:
+      memory: 1Gi
+  # Empty selectors = discover ServiceMonitors in every namespace. We need
+  # this because kubelet/cadvisor metrics arrive via a ServiceMonitor in the
+  # `monitoring` namespace targeting the kubelet Service in `kube-system`.
+  # Restricting to a label-matched subset broke cadvisor scraping (and thus
+  # CPU-based HPA) in the first version of this patch.
+  serviceMonitorNamespaceSelector: {}
+  serviceMonitorSelector: {}

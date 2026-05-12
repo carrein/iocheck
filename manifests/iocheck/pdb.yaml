@@ -1,0 +1,11 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: iocheck
+  namespace: iocheck
+spec:
+  # EXERCISE.md mandates minAvailable >= 2. Matches the Deployment's replicas
+  # floor and the autoscaler's minReplicaCount.
+  minAvailable: 2
+  selector:
+    matchLabels: { app: iocheck }

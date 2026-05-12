@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: iocheck
+  namespace: iocheck
+  labels: { app: iocheck }
+spec:
+  type: NodePort
+  selector: { app: iocheck }
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      nodePort: 30080
+  # Cluster traffic policy keeps kube-proxy's load-balancing across all pods
+  # regardless of which node received the connection — important for the
+  # in-cluster k6 Job to spread load across all replicas.
+  internalTrafficPolicy: Cluster

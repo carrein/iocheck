@@ -1,0 +1,68 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: iocheck
+  labels: { app: postgres }
+spec:
+  clusterIP: None # headless: gives stable DNS postgres-0.postgres.iocheck.svc
+  selector: { app: postgres }
+  ports:
+    - { name: pg, port: 5432, targetPort: 5432 }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: iocheck
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels: { app: postgres }
+  template:
+    metadata:
+      labels: { app: postgres }
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: postgres
+          image: postgres:17-alpine
+          # Bump max_connections to 200 so we can scale to 10 pods * 10 pool = 100
+          # without contention from monitoring + admin consumers.
+          args: ["-c", "max_connections=200", "-c", "shared_buffers=128MB"]
+          env:
+            - { name: POSTGRES_DB, value: iocheck }
+            - { name: POSTGRES_USER, value: iocheck }
+            - name: POSTGRES_PASSWORD
+              valueFrom: { secretKeyRef: { name: postgres-secret, key: POSTGRES_PASSWORD } }
+            - { name: PGDATA, value: /var/lib/postgresql/data/pgdata }
+          ports:
+            - { name: pg, containerPort: 5432 }
+          readinessProbe:
+            exec: { command: [pg_isready, -U, iocheck, -d, iocheck] }
+            periodSeconds: 3
+            timeoutSeconds: 2
+            failureThreshold: 5
+          livenessProbe:
+            exec: { command: [pg_isready, -U, iocheck, -d, iocheck] }
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 6
+          resources:
+            requests: { cpu: 200m, memory: 512Mi }
+            limits: { memory: 1Gi }
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/postgresql/data }
+            - { name: init, mountPath: /docker-entrypoint-initdb.d, readOnly: true }
+      volumes:
+        - name: init
+          configMap: { name: postgres-init }
+  volumeClaimTemplates:
+    - metadata: { name: data }
+      spec:
+        accessModes: [ReadWriteOnce]
+        # kind ships with a "standard" local-path-provisioner StorageClass.
+        storageClassName: standard
+        resources:
+          requests: { storage: 2Gi }

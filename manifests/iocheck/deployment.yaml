@@ -1,0 +1,72 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: iocheck
+  namespace: iocheck
+  labels:
+    app: iocheck
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: iocheck }
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 2
+  template:
+    metadata:
+      labels:
+        app: iocheck
+    spec:
+      terminationGracePeriodSeconds: 30
+      # Anti-affinity spreads replicas across worker nodes so a single-node
+      # failure doesn't take more than one pod down — also addresses
+      # Challenge #2 (pods sharing load) since kube-proxy round-robins
+      # ClusterIP traffic across pods on different nodes.
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels: { app: iocheck }
+                topologyKey: kubernetes.io/hostname
+      containers:
+        - name: iocheck
+          image: iocheck:dev
+          imagePullPolicy: IfNotPresent
+          ports:
+            - { name: http, containerPort: 3000 }
+          envFrom:
+            - configMapRef: { name: iocheck-config }
+          env:
+            - name: ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef: { name: iocheck-admin, key: ADMIN_TOKEN }
+          resources:
+            requests:
+              cpu: 300m
+              memory: 128Mi
+            limits:
+              cpu: 1000m
+              memory: 256Mi
+          # Liveness: always-200 /healthz; restart only if the process is wedged.
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          # Readiness: /readyz pings DB + Redis. 503 during drain/init.
+          readinessProbe:
+            httpGet: { path: /readyz, port: http }
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 2
+            successThreshold: 1
+          # Startup probe gives the pod up to 30s to come up before liveness
+          # starts ticking (Bun's dependency-wait loop can take a moment).
+          startupProbe:
+            httpGet: { path: /readyz, port: http }
+            periodSeconds: 1
+            failureThreshold: 30

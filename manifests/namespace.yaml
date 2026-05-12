@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: iocheck
+  labels:
+    name: iocheck
+    # The kube-prometheus operator's serviceMonitorNamespaceSelector matches
+    # this label so it scrapes our ServiceMonitor.
+    monitoring: "true"

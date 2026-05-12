@@ -1,0 +1,23 @@
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: iocheck
+networking:
+  apiServerAddress: "127.0.0.1"
+  kubeProxyMode: iptables
+nodes:
+  - role: control-plane
+    extraPortMappings:
+      # iocheck NodePort → localhost:8080 (manual smoke testing during demo).
+      # Prometheus + Grafana use kubectl port-forward from the Makefile;
+      # mapping them through kind would shadow port-forward binds because
+      # Docker grabs the host port even when no NodePort backend exists.
+      - { containerPort: 30080, hostPort: 8080, protocol: TCP }
+    kubeadmConfigPatches:
+      - |
+        kind: InitConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            node-labels: "ingress-ready=true"
+  - role: worker
+  - role: worker
+  - role: worker
