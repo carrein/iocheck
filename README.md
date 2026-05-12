@@ -11,8 +11,8 @@ That's it — `kind` and `kubectl` get downloaded into `./.bin/` by `make up`.
 ```bash
 git clone <repo> && cd iocheck
 make up          # ~5–6 min: cluster + KEDA + Prometheus + service + seed
-make bench-cpu   # ~10 min: CPU-HPA scenario  →  artifacts/cpu-hpa-<ts>/
-make bench-rps   # ~10 min: RPS-HPA scenario  →  artifacts/rps-hpa-<ts>/
+make bench-cpu   # ~5 min: CPU-HPA scenario  →  artifacts/cpu-hpa-<ts>/
+make bench-rps   # ~5 min: RPS-HPA scenario  →  artifacts/rps-hpa-<ts>/
 make down        # destroys cluster, removes .bin/
 ```
 

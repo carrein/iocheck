@@ -103,7 +103,7 @@ max=10 replicas.
 - Peak RPS (cluster): **956 RPS** (≈478 RPS/pod at min=2 replicas)
 - Peak per-pod CPU during burst: **20.2% of request** (~60 mCPU avg)
 - Avg per-pod CPU: **14.2%**
-- HPA fires? **No.** Replicas held at 2 for the entire 10-min bench.
+- HPA fires? **No.** Replicas held at 2 for the entire 5-min bench.
 - Peak p99 latency: **5 ms** (well under the 200 ms SLO)
 - Peak in-flight requests per pod: **4**
 
@@ -192,17 +192,19 @@ recycling, or a service mesh) that rebalances per request.
   awareness (DB pool, cache shards).
 - **Scale-up**: `stabilizationWindowSeconds: 0`, policies "+100% or +4 pods per
   15 s, take larger." Aggressive on purpose — alert storms ramp fast.
-- **Scale-down**: `stabilizationWindowSeconds: 120`, "25% per 60 s." Reduces
+- **Scale-down**: `stabilizationWindowSeconds: 60`, "25% per 60 s." Reduces
   thrash on momentary dips while still completing the drain inside the demo
-  window. Default 300 s is too patient for a 10-min demo cycle.
-- **Scale-down timing breakdown** (measured): drain begins at T+5:00. Replicas
-  begin dropping at T+7:00 (= drain + 120 s stabilization). Reach min by
-  T+9:30 (25% × 60 s × 5 steps from 10 → 2). The three knobs that produce
-  this are KEDA `pollingInterval: 15` (irrelevant during scale-down inside the
-  HPA's window), `behavior.scaleDown.stabilizationWindowSeconds: 120` (the
-  delay before any decrease), and `policies[0].periodSeconds: 60` (how fast
-  the step happens). KEDA's `cooldownPeriod` is **not** involved here — it
+  window. Default 300 s is too patient for a 5-min demo cycle.
+- **Scale-down timing breakdown** (load profile): drain begins at T+2:30
+  (after 30 s ramp + 2 min square-wave hold). Replicas begin dropping at
+  T+3:30 (= drain + 60 s stabilization), then step down 25% per 60 s from
+  10 → 2 (≈5 steps). The three knobs that produce this are KEDA
+  `pollingInterval: 15` (irrelevant during scale-down inside the HPA's
+  window), `behavior.scaleDown.stabilizationWindowSeconds: 60` (the delay
+  before any decrease), and `policies[0].periodSeconds: 60` (how fast the
+  step happens). KEDA's `cooldownPeriod` is **not** involved here — it
   only governs N → 0 transitions.
+  *Measured T-times pending re-bench against the new 5-min load profile.*
 
 Manifests: `manifests/overlays/{cpu-hpa,rps-hpa}/scaledobject.yaml`.
 

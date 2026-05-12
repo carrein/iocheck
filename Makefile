@@ -2,8 +2,8 @@
 #
 # Assessor surface (only these are documented in README):
 #   make up         bring everything up on a fresh machine
-#   make bench-cpu  run the CPU-HPA scenario (10min) + capture artifacts
-#   make bench-rps  run the RPS-HPA scenario (10min) + capture artifacts
+#   make bench-cpu  run the CPU-HPA scenario (5min) + capture artifacts
+#   make bench-rps  run the RPS-HPA scenario (5min) + capture artifacts
 #   make down       destroy the cluster and clean up host-side state
 #
 # Host requirements: Docker, bash, curl, git, make. kind + kubectl are
@@ -60,8 +60,8 @@ help: ## Show assessor targets
 	@echo ""
 	@echo "  make up         Create kind cluster, deploy everything, seed 10k IOCs."
 	@echo "                  Idempotent: re-running is a no-op when already up."
-	@echo "  make bench-cpu  CPU-based autoscaler + ~10min load + Grafana + artifacts/"
-	@echo "  make bench-rps  RPS-based autoscaler + ~10min load + Grafana + artifacts/"
+	@echo "  make bench-cpu  CPU-based autoscaler + ~5min load + Grafana + artifacts/"
+	@echo "  make bench-rps  RPS-based autoscaler + ~5min load + Grafana + artifacts/"
 	@echo "  make down       Destroy cluster, remove .bin/. Keeps artifacts/."
 	@echo ""
 	@echo "Versions: kind=$(KIND_VERSION) kubectl=$(KUBECTL_VERSION) keda=v$(KEDA_VERSION) kp=$(KP_VERSION)"

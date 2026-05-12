@@ -277,7 +277,7 @@ Files: `WRITEUP.md`
 1. **CPU calibration is empirical.** The per-cache-hit CPU estimate (~0.3 ms) drives the "CPU stays under 70%" claim. After Phase A, run a 60s flat-rate load test (single pod, no HPA) and **measure** CPU/RPS. If actual is much higher (e.g. cache-hit costs 1 ms instead of 0.3), the 300m request might let CPU sneak above 70% under burst — re-tune by raising the request to 400–500m. Locking this in is a Phase J task.
 2. **kind RAM ceiling on a laptop.** Full stack worst case: 1 cp + 3 workers + Postgres + Redis + 10× iocheck + Prometheus + Grafana + KEDA + node-exporter + k6 Job. Estimate: 4–6 GB RAM. If too tight on the target machine, drop to 2 workers (still demonstrates anti-affinity).
 3. **Bun.sql sharp edges.** None of the documented limitations (no LISTEN/NOTIFY, BIGINT-as-string, no name transform) bite this exercise. Risk: undocumented edge in a 1.3.x point release. Mitigation: keep `porsager/postgres` as a one-import swap.
-4. **HPA scale-down stabilization tuning.** Default 300s is too slow for a 10-min demo. `120s` is the planned value but may need to drop to 60s if the drain segment runs out of room. Verify in Phase J.
+4. **HPA scale-down stabilization tuning.** Default 300s is too slow for a 5-min demo. `120s` is the planned value but may need to drop to 60s if the drain segment runs out of room. Verify in Phase J.
 5. **k6 push to Prometheus.** Requires `enableRemoteWriteReceiver: true` on the Prometheus CR. Silent failure if omitted. Verify in Phase E.
 6. **In-cluster k6 hits ClusterIP; per-pod balance depends on kube-proxy iptables hashing.** Should be within ±10% but not perfect. If a worse split shows, switch the Service to `internalTrafficPolicy: Cluster` (default) and ensure k6 has many concurrent VUs (open-model executor does).
 7. **30-min walkthrough timing.** Full cycle (cluster up → scenario A → scenario B → tear down) is tight. Pre-warm: run `make up` before the call; do scenarios live.
@@ -294,7 +294,7 @@ Files: `WRITEUP.md`
   pair committed under `artifacts/sample/`.
 - Assessor surface = 4 Make targets (`up`, `bench-cpu`, `bench-rps`, `down`).
   Confirmed end-to-end on a fresh cluster: `make up` (~6 min), bench-cpu and
-  bench-rps each run a 10-min profile and write an artifact directory.
+  bench-rps each run a 5-min profile and write an artifact directory.
 
 ### Deviations from the plan
 - **kind extraPortMappings for Prometheus + Grafana removed** (Phase D). Docker
