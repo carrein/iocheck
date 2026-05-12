@@ -1,29 +1,89 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Guidance for Claude Code sessions in this repository.
 
 ## What this repo is
 
-A Claude Code working directory with a project-local `.claude/` config. It is not a software project — there is no build, lint, or test toolchain. The only executable code is `.claude/render-session.py`.
+**iocheck** — a take-home implementation for the brief in [`EXERCISE.md`](./EXERCISE.md):
+a Bun + TypeScript threat-intel lookup service on a local kind Kubernetes cluster,
+with a KEDA-managed custom-metric HPA that beats CPU-based autoscaling on this
+workload. End-user docs: [`README.md`](./README.md) (quickstart) and
+[`WRITEUP.md`](./WRITEUP.md) (architecture, four challenges, future work).
 
-`.envrc` sets `CLAUDE_CONFIG_DIR="$PWD/.claude"` (direnv), so Claude Code uses the in-repo config, sessions, skills, and history rather than the user-global `~/.claude`. Run `direnv allow` after cloning.
+`.envrc` sets `CLAUDE_CONFIG_DIR="$PWD/.claude"` (direnv), so Claude Code uses
+in-repo config rather than user-global `~/.claude`. Run `direnv allow` after cloning.
+
+## Assessor-facing surface
+
+Exactly four Make targets. Anything more granular is a private `.`-prefixed phase.
+
+```
+make up         # download .bin/{kind,kubectl}, create cluster, deploy, seed 10k IOCs
+make bench-cpu  # CPU-HPA scenario + 10-min load + Grafana + artifacts/
+make bench-rps  # RPS-HPA scenario + 10-min load + Grafana + artifacts/
+make down       # destroy cluster, remove .bin/, keep artifacts/
+```
+
+Host floor: Docker + git + make. Bun, kubectl, kind, KEDA, kube-prometheus, k6 —
+all downloaded or cluster-installed by `make up`.
 
 ## Layout
 
-- `.claude/settings.json` — the only Claude Code config that is tracked. Currently registers a single `Stop` hook.
-- `.claude/render-session.py` — the Stop-hook script. Tracked.
-- `.claude/skills/` — symlinks to the user's personal skills under `~/.claude/skills/carrein-*`. Not tracked (excluded by `.gitignore`); recreate by symlinking if missing.
-- `.claude/` everything else (sessions, history, plugins, backups, shell snapshots) — runtime state, ignored by `.gitignore`.
-- `logs/` — markdown transcripts produced by the Stop hook, one file per session.
+- `src/` — Bun service (`server.ts`, `db.ts`, `cache.ts`, `metrics.ts`, `lookup.ts`,
+  `admin.ts`, `shutdown.ts`, `types.ts`)
+- `tests/` — `bun:test` suite (`setup.ts` creates an ephemeral schema)
+- `scripts/` — `bootstrap.sh` (kind/kubectl downloader), `seed.ts` (10k IOCs),
+  `capture.ts` (bench artifact generator)
+- `manifests/` — namespace, postgres, redis, iocheck, monitoring patches,
+  Kustomize overlays under `manifests/overlays/{cpu-hpa,rps-hpa}/`
+- `loadtest/` — k6 script, ConfigMap, Job
+- `dashboards/` — Grafana dashboard JSON, auto-imported by `make up`
+- `artifacts/sample/` — committed sample bench output for reference
+- `Dockerfile`, `docker-compose.yml`, `kind-config.yaml`, `Makefile`
+- `.claude/plans/iocheck-plan.md` + `iocheck-research.md` — durable design context;
+  read these before re-deriving decisions or proposing changes to calibrated values
+- `.claude/projects/.../memory/` — per-project memory (user preferences, project facts)
 
-## Session renderer hook
+## Claude infrastructure
 
-`.claude/settings.json` runs `python3 .claude/render-session.py` on every `Stop` event. The script:
+- `.claude/settings.json` — tracked. Registers a single `Stop` hook.
+- `.claude/render-session.py` — tracked Stop-hook script.
+- `.claude/skills/` — symlinks to `~/.claude/skills/carrein-*` (gitignored;
+  recreate by symlinking).
+- `.claude/` everything else — runtime state, gitignored.
+- `logs/` — markdown transcripts produced by the Stop hook (EXERCISE.md deliverable
+  for "AI chat logs").
 
-1. Reads `transcript_path` from the hook payload on stdin and waits for the JSONL file to stabilize (`wait_for_stable`, max 2s).
-2. Walks the events: emits `## User` blocks for plain-text user turns and `## Assistant` blocks for assistant turns, summarizing each `tool_use` block as `> ToolName: <command|file_path|description|pattern>` (truncated at 100 chars).
-3. Writes the markdown to `logs/<slug>.md` where the slug is the kebab-cased `aiTitle` if one has been emitted, otherwise the `sessionId`. When a title appears later, the older `<sessionId>.md` file is deleted so each session has exactly one log.
+### Session renderer hook
 
-`CLAUDE_PROJECT_DIR` (set by the harness) determines the `logs/` location; it falls back to `cwd`.
+`.claude/settings.json` runs `python3 .claude/render-session.py` on every `Stop`
+event. The script:
 
-When editing the renderer, remember the contract: it must accept the Stop-hook JSON payload on stdin, must not raise on malformed transcripts (the `try/except` around `json.loads` is load-bearing — sessions are read while still being written), and must be idempotent if run twice on the same transcript.
+1. Reads `transcript_path` from the hook payload on stdin and waits for the JSONL
+   file to stabilize (`wait_for_stable`, max 2s).
+2. Walks the events: emits `## User` blocks for plain-text user turns and
+   `## Assistant` blocks for assistant turns, summarizing each `tool_use` block as
+   `> ToolName: <command|file_path|description|pattern>` (truncated at 100 chars).
+3. Writes the markdown to `logs/<slug>.md` where the slug is the kebab-cased
+   `aiTitle` if one has been emitted, otherwise the `sessionId`. When a title
+   appears later, the older `<sessionId>.md` file is deleted so each session has
+   exactly one log.
+
+`CLAUDE_PROJECT_DIR` (set by the harness) determines the `logs/` location; it
+falls back to `cwd`.
+
+When editing the renderer, remember the contract: it must accept the Stop-hook
+JSON payload on stdin, must not raise on malformed transcripts (the `try/except`
+around `json.loads` is load-bearing — sessions are read while still being
+written), and must be idempotent if run twice on the same transcript.
+
+## Development conventions
+
+- TypeScript strict mode (`tsconfig.json`); typecheck with `bunx tsc --noEmit`.
+- Tests run with `DATABASE_URL` + `REDIS_URL` pointing at a real Postgres + Redis
+  (the `bun:test` `setup.ts` creates and tears down an ephemeral schema per run).
+- Comments: only where the *why* is non-obvious (subtle invariant, vendor gotcha
+  documented inline in YAML, etc.). Don't narrate what the code does.
+- Calibrated values (resources, replicas, RPS targets, scale windows) have
+  rationale in `.claude/plans/iocheck-plan.md` and `WRITEUP.md`. Don't change
+  them blind to those documents.
