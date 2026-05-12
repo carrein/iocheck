@@ -1,3 +1,28 @@
 .claude/*
 !.claude/settings.json
 !.claude/render-session.py
+!.claude/plans/
+
+# Bun / Node
+node_modules/
+*.tsbuildinfo
+
+# Local tool cache (downloaded by `make up`)
+.bin/
+
+# Bench artifacts (regenerated; sample committed under artifacts/sample/)
+artifacts/*
+!artifacts/sample/
+!artifacts/.gitkeep
+
+# Editor + OS
+.DS_Store
+.vscode/
+.idea/
+
+# Env files with secrets (the repo ships only .env.example)
+.env
+.env.local
+
+# Background PID files
+.bench.pid
