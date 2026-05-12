@@ -30,7 +30,11 @@ spec:
   fallback:
     failureThreshold: 3
     replicas: 4
-    behavior: static
+    # currentReplicasIfHigher: hold or move up on a Prometheus blip, never
+    # scale down. Beats `static`, which would pin to 4 even if we were
+    # already at 8 mid-burst — i.e. down-scale us at the worst moment.
+    # Requires KEDA >= 2.17.
+    behavior: currentReplicasIfHigher
   advanced:
     horizontalPodAutoscalerConfig:
       behavior:

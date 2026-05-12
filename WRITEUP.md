@@ -266,8 +266,11 @@ is affected.
 **Mitigation in place**:
 - KEDA `fallback.replicas: 4` — mid-load floor. Neither starves at min nor
   thunders to max. Configured in `manifests/overlays/rps-hpa/scaledobject.yaml`.
-- `behavior: static` (vs. `currentReplicas` or `currentReplicasIfHigher`) — keeps
-  the replica count fixed during the outage rather than drifting.
+- `behavior: currentReplicasIfHigher` — holds the current replica count if
+  it's already above the fallback floor, otherwise lifts to 4. Beats `static`,
+  which would *down-scale* us to 4 even if we were already at 8 mid-burst —
+  the worst possible moment to lose pods. Matches KEDA's and Kedify's
+  production recommendation. Requires KEDA ≥ 2.17.
 - The PDB (`minAvailable: 2`) ensures the fallback never violates the floor.
 
 **Reproduction** (manual, not part of the standard bench): scale Prometheus
