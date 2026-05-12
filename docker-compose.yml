@@ -1,0 +1,59 @@
+# Dev-mode stack for iterating on iocheck without k8s.
+# k8s deployment is the primary delivery; this is a convenience.
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: iocheck
+      POSTGRES_USER: iocheck
+      POSTGRES_PASSWORD: iocheckdev
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./manifests/postgres/init:/docker-entrypoint-initdb.d:ro
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U iocheck -d iocheck"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  redis:
+    image: redis:7.4-alpine
+    command:
+      - redis-server
+      - --maxmemory
+      - 256mb
+      - --maxmemory-policy
+      - allkeys-lru
+      - --save
+      - ""
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  iocheck:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: iocheck:dev
+    environment:
+      PORT: "3000"
+      DATABASE_URL: postgres://iocheck:iocheckdev@postgres:5432/iocheck
+      REDIS_URL: redis://redis:6379
+      ADMIN_TOKEN: dev-admin-token
+    ports:
+      - "3000:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  pgdata:
