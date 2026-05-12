@@ -40,11 +40,21 @@ def render(transcript_path: Path, repo_root: Path) -> None:
 
     title = None
     session_id = None
+    command_name = None
+    first_text = None
     for e in events:
         if e.get("type") == "ai-title" and e.get("aiTitle"):
             title = e["aiTitle"]
         if not session_id:
             session_id = e.get("sessionId")
+        if command_name is None and first_text is None and e.get("type") == "user":
+            content = (e.get("message") or {}).get("content")
+            if isinstance(content, str) and content.strip():
+                m = re.search(r"<command-name>/([\w-]+)</command-name>", content)
+                if m:
+                    command_name = m.group(1)
+                elif not content.lstrip().startswith("<"):
+                    first_text = " ".join(content.split()[:8])
 
     blocks = []
     for e in events:
@@ -80,17 +90,27 @@ def render(transcript_path: Path, repo_root: Path) -> None:
             if text:
                 blocks.append(f"## Assistant\n\n{text}\n")
 
-    header = f"# Session: {title or session_id or 'unknown'}\n\n"
+    display = title or command_name or first_text or session_id or "unknown"
+    header = f"# Session: {display}\n\n"
     body = header + "\n".join(blocks)
 
     logs = repo_root / "logs"
     logs.mkdir(exist_ok=True)
 
-    name = kebab(title) if title else (session_id or "unknown")
+    if title:
+        name = kebab(title)
+    elif command_name:
+        name = command_name
+    elif first_text:
+        name = kebab(first_text)
+    else:
+        name = session_id or "unknown"
     out = logs / f"{name}.md"
 
-    if title and session_id:
-        old = logs / f"{session_id}.md"
+    for alt in (session_id, command_name, kebab(first_text) if first_text else None):
+        if not alt:
+            continue
+        old = logs / f"{alt}.md"
         if old.exists() and old != out:
             old.unlink()
 
