@@ -1,16 +1,23 @@
 // k6 load script for iocheck.
 //
 // Profile (open model — ramping-arrival-rate):
-//   00:00 → 01:00   ramp 0 → 100 RPS (baseline)
-//   01:00 → 05:00   sustained 1000 RPS (10x burst, matches EXERCISE.md)
-//   05:00 → 10:00   drain 1000 → 0 RPS
+//   00:00 → 00:30   ramp 0 → TARGET_RPS (baseline)
+//   00:30 → 02:30   sustained TARGET_RPS (10x burst, matches EXERCISE.md)
+//   02:30 → 05:00   drain TARGET_RPS → 0
 //
 // Why ramping-arrival-rate (not ramping-vus): we want to drive a fixed
 // throughput regardless of how fast each request returns. With VUs, slow
 // responses cap our actual RPS — which would mask the very latency
 // degradation we're trying to surface.
 //
-// Hot/cold distribution:
+// Env knobs:
+//   TARGET_RPS    sustained RPS during the plateau (default 1000)
+//   CACHE_BUSTER  when "1", every request is a random IOC → 100% cache
+//                 miss, 100% DB miss. Use to put I/O pressure on pods
+//                 without driving CPU up (the regime that exposes
+//                 CPU-HPA's structural blindness on async workloads).
+//
+// Default hot/cold mix (CACHE_BUSTER unset):
 //   90% of requests hit one of 100 "hot" IOCs (deterministic values
 //        also produced by scripts/seed.ts → near-perfect cache hits)
 //   10% of requests hit "cold" IOCs (random values, miss path → DB)
@@ -19,19 +26,33 @@ import http from "k6/http";
 import { check } from "k6";
 
 const TARGET_HOST = __ENV.TARGET_HOST || "http://iocheck.iocheck.svc:80";
+// TARGET_RPS is the CLUSTER-WIDE target; each parallel k6 pod drives a share.
+const TARGET_RPS_TOTAL = Number(__ENV.TARGET_RPS || 1000);
+const PARALLELISM = Math.max(1, Number(__ENV.PARALLELISM || 1));
+const TARGET_RPS = Math.ceil(TARGET_RPS_TOTAL / PARALLELISM);
+const CACHE_BUSTER = __ENV.CACHE_BUSTER === "1";
 
 export const options = {
   discardResponseBodies: true,
+  // Disable HTTP keep-alive. kube-proxy iptables mode load-balances at
+  // TCP-connect time; reused connections pin all subsequent requests to
+  // whichever pod was picked when the connection opened. Without this, pods
+  // that the HPA adds mid-bench receive ~0 traffic because all VUs are
+  // already attached to the original pods. Verified empirically: enabling
+  // reuse left 8/10 RPS-HPA replicas idle while 2 absorbed all load.
+  noConnectionReuse: true,
   scenarios: {
     load: {
       executor: "ramping-arrival-rate",
       startRate: 1,
       timeUnit: "1s",
-      preAllocatedVUs: 200,
-      maxVUs: 500,
+      // Scale VU pools with TARGET_RPS so high-RPS cold runs (where
+      // per-request latency is higher) don't starve for VUs.
+      preAllocatedVUs: Math.max(200, Math.ceil(TARGET_RPS * 0.3)),
+      maxVUs: Math.max(500, Math.ceil(TARGET_RPS * 0.8)),
       stages: [
-        { duration: "30s", target: 1000 },
-        { duration: "2m", target: 1000 },
+        { duration: "30s", target: TARGET_RPS },
+        { duration: "2m", target: TARGET_RPS },
         { duration: "2m30s", target: 0 },
       ],
     },
@@ -77,7 +98,11 @@ function randomCold() {
 }
 
 export default function () {
-  const target = Math.random() < 0.9 ? HOT[Math.floor(Math.random() * HOT.length)] : randomCold();
+  const target = CACHE_BUSTER
+    ? randomCold()
+    : Math.random() < 0.9
+    ? HOT[Math.floor(Math.random() * HOT.length)]
+    : randomCold();
   const res = http.post(
     `${TARGET_HOST}/lookup`,
     JSON.stringify(target),

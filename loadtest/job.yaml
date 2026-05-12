@@ -14,12 +14,28 @@ metadata:
 spec:
   backoffLimit: 0
   ttlSecondsAfterFinished: 1800
+  # Four parallel load-generators. Without parallelism + `noConnectionReuse`
+  # in the k6 script, a single k6 pod with keep-alive pins all VUs to
+  # whichever iocheck pods existed at TCP-connect time, leaving newly-scaled
+  # replicas idle. With noConnectionReuse, a single pod runs out of source
+  # ports above ~500 RPS. Four pods, each forcing fresh TCP per request,
+  # multiplies the port budget and lets kube-proxy load-balance evenly.
+  parallelism: 4
+  completions: 4
   template:
     metadata:
       labels:
         app: k6
     spec:
       restartPolicy: Never
+      # Expand ephemeral port range from default 32768–60999 to 1024–65535.
+      # `ip_local_port_range` is a "safe" sysctl in kubelet, no privileged
+      # container needed. Necessary for sustained high-RPS runs where each
+      # request opens a fresh TCP connection.
+      securityContext:
+        sysctls:
+          - name: net.ipv4.ip_local_port_range
+            value: "1024 65535"
       containers:
         - name: k6
           image: grafana/k6:1.3.0
@@ -28,13 +44,42 @@ spec:
             - --out=experimental-prometheus-rw
             - --summary-export=/artifacts/k6-summary.json
             - --tag=testid=$(SCENARIO)-$(TESTID)
+            # Per-pod tag so each parallel k6 pod produces a distinct
+            # remote-write series. Without this, all 4 pods emit identically
+            # labeled samples (e.g. k6_http_reqs_total{testid=...}) and
+            # Prometheus rejects the concurrent writes as "duplicate sample"
+            # / "out of order" with HTTP 400.
+            - --tag=instance=$(POD_NAME)
             - /scripts/script.js
+          # Multi-line env (not inline-flow) so the Makefile's `sed ... $`
+          # anchor can substitute these defaults at apply time. With inline
+          # `{ name: X, value: "Y" }`, the line ends with ` }` and the
+          # substitution silently fails.
+          # Defaults below are unique sentinels so the Makefile's sed
+          # patterns can target each var unambiguously.
           env:
-            - { name: SCENARIO, value: "unknown" }
-            - { name: TESTID, value: "0" }
-            - { name: TARGET_HOST, value: "http://iocheck.iocheck.svc:80" }
-            - { name: K6_PROMETHEUS_RW_SERVER_URL, value: "http://prometheus-k8s.monitoring.svc:9090/api/v1/write" }
-            - { name: K6_PROMETHEUS_RW_TREND_STATS, value: "p(50),p(95),p(99),min,max" }
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: SCENARIO
+              value: "unknown"
+            - name: TESTID
+              value: "0"
+            - name: TARGET_HOST
+              value: "http://iocheck.iocheck.svc:80"
+            # TARGET_RPS is the CLUSTER-WIDE target. The k6 script divides
+            # by PARALLELISM so each pod drives its share.
+            - name: TARGET_RPS
+              value: "1000"
+            - name: PARALLELISM
+              value: "4"
+            - name: CACHE_BUSTER
+              value: "off"
+            - name: K6_PROMETHEUS_RW_SERVER_URL
+              value: "http://prometheus-k8s.monitoring.svc:9090/api/v1/write"
+            - name: K6_PROMETHEUS_RW_TREND_STATS
+              value: "p(50),p(95),p(99),min,max"
           resources:
             requests: { cpu: 500m, memory: 256Mi }
             limits: { memory: 1Gi }

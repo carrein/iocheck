@@ -58,11 +58,12 @@ endef
 help: ## Show assessor targets
 	@echo "iocheck — assessor targets"
 	@echo ""
-	@echo "  make up         Create kind cluster, deploy everything, seed 10k IOCs."
-	@echo "                  Idempotent: re-running is a no-op when already up."
-	@echo "  make bench-cpu  CPU-based autoscaler + ~5min load + Grafana + artifacts/"
-	@echo "  make bench-rps  RPS-based autoscaler + ~5min load + Grafana + artifacts/"
-	@echo "  make down       Destroy cluster, remove .bin/. Keeps artifacts/."
+	@echo "  make up             Create kind cluster, deploy everything, seed 10k IOCs."
+	@echo "                      Idempotent: re-running is a no-op when already up."
+	@echo "  make bench-cpu      CPU-based autoscaler + ~5min load + Grafana + artifacts/"
+	@echo "  make bench-rps      RPS-based autoscaler + ~5min load + Grafana + artifacts/"
+	@echo "  make bench-rps-miss RPS-HPA + 100%-cache-miss load (DB-saturation probe)"
+	@echo "  make down           Destroy cluster, remove .bin/. Keeps artifacts/."
 	@echo ""
 	@echo "Versions: kind=$(KIND_VERSION) kubectl=$(KUBECTL_VERSION) keda=v$(KEDA_VERSION) kp=$(KP_VERSION)"
 
@@ -73,9 +74,10 @@ up: .bootstrap .image .cluster .keda .monitoring .stack .seed .grafana-dashboard
 	@echo " iocheck cluster is ready."
 	@echo ""
 	@echo " Next steps:"
-	@echo "   make bench-cpu   (CPU autoscaler — fails to scale; demonstrates challenge #1)"
-	@echo "   make bench-rps   (RPS autoscaler — scales 2→10→2)"
-	@echo "   make down        (tear down)"
+	@echo "   make bench-cpu       (CPU autoscaler — fails to scale; demonstrates challenge #1)"
+	@echo "   make bench-rps       (RPS autoscaler — scales 2→10→2)"
+	@echo "   make bench-rps-miss  (RPS autoscaler + all-miss workload — DB-saturation probe)"
+	@echo "   make down            (tear down)"
 	@echo ""
 	@echo " Live dashboards (started during bench-*):"
 	@echo "   Grafana    http://localhost:3000   (anonymous, lands on iocheck dashboard)"
@@ -101,13 +103,21 @@ down: ## Destroy everything; no residue left in host state
 
 .PHONY: bench-cpu
 bench-cpu: SCENARIO := cpu-hpa
-bench-cpu: ## CPU-based HPA scenario + load test + artifacts
-	@$(MAKE) _bench SCENARIO=cpu-hpa OVERLAY=manifests/overlays/cpu-hpa OTHER_OVERLAY=manifests/overlays/rps-hpa
+bench-cpu: ## CPU-based HPA scenario + load test + artifacts (set COLD=1 for cache-bust)
+	@$(MAKE) _bench SCENARIO=cpu-hpa OVERLAY=manifests/overlays/cpu-hpa OTHER_OVERLAY=manifests/overlays/rps-hpa COLD=$(COLD)
 
 .PHONY: bench-rps
 bench-rps: SCENARIO := rps-hpa
-bench-rps: ## RPS-based HPA scenario + load test + artifacts
-	@$(MAKE) _bench SCENARIO=rps-hpa OVERLAY=manifests/overlays/rps-hpa OTHER_OVERLAY=manifests/overlays/cpu-hpa
+bench-rps: ## RPS-based HPA scenario + load test + artifacts (set COLD=1 for cache-bust)
+	@$(MAKE) _bench SCENARIO=rps-hpa OVERLAY=manifests/overlays/rps-hpa OTHER_OVERLAY=manifests/overlays/cpu-hpa COLD=$(COLD)
+
+.PHONY: bench-rps-miss
+# All-miss workload: every request is a random IOC the service has never seen,
+# so cache hit rate is ~0 and every lookup hits Postgres. Surfaces the failure
+# mode WRITEUP.md §"Beyond the wrong-signal answer" describes — RPS scaling
+# adds pods that all then queue on the same finite DB connection pool.
+bench-rps-miss: ## RPS-HPA scenario, 100%-cache-miss workload (DB-saturation probe)
+	@$(MAKE) _bench SCENARIO=rps-hpa OVERLAY=manifests/overlays/rps-hpa OTHER_OVERLAY=manifests/overlays/cpu-hpa COLD=1
 
 # ---- private targets ---------------------------------------------------------
 .PHONY: .bootstrap
@@ -220,6 +230,13 @@ bench-rps: ## RPS-based HPA scenario + load test + artifacts
 	@echo "set iocheck as Grafana home dashboard"
 
 .PHONY: _bench
+# Derive workload knobs from the COLD flag.
+#   hot  (default): cache-friendly 90/10 mix at 1000 RPS — the realistic regime
+#   cold (COLD=1):  100% random IOCs at 2000 RPS — exposes async I/O saturation
+#                   that doesn't show up in CPU usage
+_bench: CACHE_BUSTER := $(if $(filter 1,$(COLD)),1,off)
+_bench: TARGET_RPS   := $(if $(filter 1,$(COLD)),5000,1000)
+_bench: MODE         := $(if $(filter 1,$(COLD)),cold,hot)
 _bench:
 	@if [ -z "$(SCENARIO)" ] || [ -z "$(OVERLAY)" ]; then \
 	  echo "_bench: SCENARIO and OVERLAY must be set"; exit 1; \
@@ -257,9 +274,11 @@ _bench:
 
 	# Launch the k6 Job with scenario-tagged metrics.
 	@testid=$$(date +%Y%m%dT%H%M%SZ); \
-	 echo "[4/6] launching k6 (scenario=$(SCENARIO), testid=$$testid)..."; \
+	 echo "[4/6] launching k6 (scenario=$(SCENARIO), testid=$$testid, mode=$(MODE), target_rps=$(TARGET_RPS))..."; \
 	 sed -e "s/value: \"unknown\"$$/value: \"$(SCENARIO)\"/" \
 	     -e "s/value: \"0\"$$/value: \"$$testid\"/" \
+	     -e "s/value: \"1000\"$$/value: \"$(TARGET_RPS)\"/" \
+	     -e "s/value: \"off\"$$/value: \"$(CACHE_BUSTER)\"/" \
 	     $(CURDIR)/loadtest/job.yaml | $(KUBECTL) apply -f -
 
 	@echo ""
@@ -268,11 +287,11 @@ _bench:
 	@echo ""
 
 	# Start the capture script in the background; tee k6 logs.
-	@artdir=artifacts/$(SCENARIO)-$$(date +%Y%m%dT%H%M%SZ); \
+	@artdir=artifacts/$(SCENARIO)-$(MODE)-$$(date +%Y%m%dT%H%M%SZ); \
 	 mkdir -p $$artdir; \
 	 echo "[5/6] artifacts → $$artdir"; \
 	 ARTIFACT_DIR=$$artdir SCENARIO=$(SCENARIO) PROM_URL=http://localhost:9090 \
-	   KUBECTL=$(KUBECTL) \
+	   KUBECTL=$(KUBECTL) MODE=$(MODE) TARGET_RPS=$(TARGET_RPS) CACHE_BUSTER=$(CACHE_BUSTER) \
 	   bun run $(CURDIR)/scripts/capture.ts > $$artdir/capture.log 2>&1 & \
 	 echo $$! > $(PIDS_DIR)/capture.pid; \
 	 echo "[6/6] streaming k6 output (Ctrl-C to stop early)..."; \

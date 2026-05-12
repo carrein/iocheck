@@ -10,11 +10,17 @@ That's it — `kind` and `kubectl` get downloaded into `./.bin/` by `make up`.
 
 ```bash
 git clone <repo> && cd iocheck
-make up          # ~5–6 min: cluster + KEDA + Prometheus + service + seed
-make bench-cpu   # ~5 min: CPU-HPA scenario  →  artifacts/cpu-hpa-<ts>/
-make bench-rps   # ~5 min: RPS-HPA scenario  →  artifacts/rps-hpa-<ts>/
-make down        # destroys cluster, removes .bin/
+make up              # ~5–6 min: cluster + KEDA + Prometheus + service + seed
+make bench-cpu       # ~5 min: CPU-HPA scenario       →  artifacts/cpu-hpa-<ts>/
+make bench-rps       # ~5 min: RPS-HPA scenario       →  artifacts/rps-hpa-<ts>/
+make bench-rps-miss  # ~5 min: RPS-HPA + all-miss     →  artifacts/rps-hpa-cold-<ts>/
+make down            # destroys cluster, removes .bin/
 ```
+
+`bench-rps-miss` is the 100%-cache-miss variant — every lookup misses the
+cache and goes to Postgres. It's the workload regime where RPS scaling can
+add pods that all then queue on the same finite DB pool, exposing the
+caveat discussed in `WRITEUP.md` § "Beyond the wrong-signal answer".
 
 Once `make up` finishes, Grafana is reachable at <http://localhost:3000> with
 anonymous access — it lands directly on the iocheck dashboard, no login needed.
