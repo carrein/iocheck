@@ -1,0 +1,38 @@
+# Overrides kube-prometheus's grafana-config Secret to disable the login wall.
+# Applied after `kubectl apply -f kube-prometheus/manifests` so it wins; the
+# Grafana deployment is then rolled to pick up the new grafana.ini.
+#
+# auth.anonymous.enabled + disable_login_form together mean a visitor lands
+# directly on the home dashboard with no login prompt. Admin role removes the
+# "you don't have permission" friction for any UI action (time range, refresh,
+# panel inspect). Acceptable here because the cluster is single-user and lives
+# only on the assessor's laptop.
+#
+# The home dashboard itself is set via /api/org/preferences after the iocheck
+# dashboard is imported (see Makefile `.grafana-dashboard`).
+apiVersion: v1
+kind: Secret
+metadata:
+  name: grafana-config
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/component: grafana
+    app.kubernetes.io/name: grafana
+    app.kubernetes.io/part-of: kube-prometheus
+type: Opaque
+stringData:
+  grafana.ini: |
+    [date_formats]
+    default_timezone = UTC
+
+    [auth]
+    disable_login_form = true
+    disable_signout_menu = true
+
+    [auth.anonymous]
+    enabled = true
+    org_name = Main Org.
+    org_role = Admin
+
+    [users]
+    default_theme = dark

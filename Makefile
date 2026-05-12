@@ -78,7 +78,7 @@ up: .bootstrap .image .cluster .keda .monitoring .stack .seed .grafana-dashboard
 	@echo "   make down        (tear down)"
 	@echo ""
 	@echo " Live dashboards (started during bench-*):"
-	@echo "   Grafana    http://localhost:3000   (admin/admin)"
+	@echo "   Grafana    http://localhost:3000   (anonymous, lands on iocheck dashboard)"
 	@echo "   Prometheus http://localhost:9090"
 	@echo "================================================================"
 
@@ -169,6 +169,12 @@ bench-rps: ## RPS-based HPA scenario + load test + artifacts
 	@# Extend to KEDA (autoscaler queries) and any monitoring-labelled namespace
 	@# (k6 remote-write).
 	@$(KUBECTL) apply -f $(CURDIR)/manifests/monitoring/prometheus-netpol-patch.yaml
+	@# Override Grafana's grafana.ini to enable anonymous Admin access (no login
+	@# wall) and roll the deployment so the new config is mounted. Must come
+	@# after the kube-prometheus apply above, otherwise it would be clobbered.
+	@echo "configuring Grafana for anonymous access..."
+	@$(KUBECTL) apply -f $(CURDIR)/manifests/monitoring/grafana-config.yaml
+	@$(KUBECTL) -n $(PROM_NS) rollout restart deployment/grafana
 	@$(KUBECTL) -n $(PROM_NS) wait --for=condition=Available --timeout=300s deployment/grafana deployment/prometheus-operator
 	@$(KUBECTL) -n $(PROM_NS) rollout status statefulset/prometheus-k8s --timeout=300s
 
@@ -206,6 +212,12 @@ bench-rps: ## RPS-based HPA scenario + load test + artifacts
 	    -d "$$body" \
 	    http://127.0.0.1:3000/api/dashboards/db >/dev/null && \
 	  echo "dashboard imported → http://localhost:3000/d/iocheck"'
+	@# Set the iocheck dashboard as the org's home dashboard so the root URL
+	@# (and the anonymous landing page) goes straight to it.
+	@curl -fsS -u admin:admin -X PUT -H "Content-Type: application/json" \
+	  -d '{"homeDashboardUID":"iocheck"}' \
+	  http://127.0.0.1:3000/api/org/preferences >/dev/null
+	@echo "set iocheck as Grafana home dashboard"
 
 .PHONY: _bench
 _bench:
@@ -250,12 +262,10 @@ _bench:
 	     -e "s/value: \"0\"$$/value: \"$$testid\"/" \
 	     $(CURDIR)/loadtest/job.yaml | $(KUBECTL) apply -f -
 
-	# Open browser to Grafana dashboard (best-effort; skip in CI).
-	@if command -v open >/dev/null; then \
-	   open "http://localhost:3000/d/iocheck?refresh=5s&from=now-2m&to=now%2B15m" 2>/dev/null || true; \
-	 elif command -v xdg-open >/dev/null; then \
-	   xdg-open "http://localhost:3000/d/iocheck?refresh=5s&from=now-2m&to=now%2B15m" >/dev/null 2>&1 || true; \
-	 fi
+	@echo ""
+	@echo "    Grafana: http://localhost:3000/d/iocheck?refresh=5s&from=now-2m&to=now%2B15m"
+	@echo "    (anonymous access — no login required)"
+	@echo ""
 
 	# Start the capture script in the background; tee k6 logs.
 	@artdir=artifacts/$(SCENARIO)-$$(date +%Y%m%dT%H%M%SZ); \

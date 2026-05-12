@@ -16,10 +16,11 @@ make bench-rps   # ~10 min: RPS-HPA scenario  →  artifacts/rps-hpa-<ts>/
 make down        # destroys cluster, removes .bin/
 ```
 
-A Grafana tab opens automatically during each `bench-*` (admin/admin, dashboard
-"iocheck"). A `summary.md` is printed to stdout when each bench finishes and
-also saved under `artifacts/<scenario>-<timestamp>/` alongside the raw
-trajectories.
+Once `make up` finishes, Grafana is reachable at <http://localhost:3000> with
+anonymous access — it lands directly on the iocheck dashboard, no login needed.
+The Grafana port-forward is (re)started at the top of each `bench-*` run. A
+`summary.md` is printed to stdout when each bench finishes and also saved under
+`artifacts/<scenario>-<timestamp>/` alongside the raw trajectories.
 
 ## What gets built
 
