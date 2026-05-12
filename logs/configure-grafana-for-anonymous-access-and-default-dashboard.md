@@ -106,3 +106,110 @@ All changes applied. Summary:
 **README** quickstart updated to drop the "tab opens automatically" / `admin/admin` line.
 
 Next time `make up` runs, visit <http://localhost:3000> manually — anonymous access lands on the iocheck dashboard with no login.
+
+## User
+
+<command-message>carrein-commit</command-message>
+<command-name>/carrein-commit</command-name>
+
+## Assistant
+
+> Bash: git status
+
+## Assistant
+
+> Bash: git diff --stat
+
+## Assistant
+
+> Bash: git log --oneline -20
+
+## Assistant
+
+> Bash: git branch --show-current
+
+## Assistant
+
+> Bash: git log -20 --format="%H%n%B%n---"
+
+## Assistant
+
+Style: conventional commits (`feat:`/`chore:`/`docs:`), lowercase subject, prose body explaining the *why*, `Co-Authored-By: Claude` trailer.
+
+Two logical commits:
+1. **feat**: Grafana anonymous access + default dashboard (manifest + Makefile + README)
+2. **chore**: session logs
+
+Let me check for lint/test infra before committing.
+
+## Assistant
+
+> Bash: cat /Users/carrein/Desktop/iocheck2/package.json | head -40
+
+## Assistant
+
+> Bash: ls /Users/carrein/Desktop/iocheck2/.claude/settings.json /Users/carrein/Desktop/iocheck2/.husky 2>&1...
+
+## Assistant
+
+Changes are YAML/Makefile/Markdown only — no TS to typecheck and the test suite needs a live Postgres+Redis. Proceeding with the two-commit split.
+
+## Assistant
+
+> Bash: git add manifests/monitoring/grafana-config.yaml Makefile README.md && git status
+
+## Assistant
+
+> Bash: git commit -m "$(cat <<'EOF'
+feat: drop Grafana login wall and default to iocheck dashboard
+
+Overrid...
+
+## Assistant
+
+> Bash: git add logs/ && git status
+
+## Assistant
+
+> Bash: git commit -m "$(cat <<'EOF'
+chore: update session logs
+
+Append the two latest rendered transcripts ...
+
+## Assistant
+
+> Bash: git push 2>&1
+
+## Assistant
+
+> Bash: git remote -v
+
+## Assistant
+
+Commits are in place but the repo has no remote configured — I won't add one without your direction.
+
+## Assistant
+
+> Bash: git log --oneline -4
+
+## Assistant
+
+```
+═══════════════════════════════════════
+  COMMIT & PUSH SUMMARY
+  Branch: master
+  Remote: (none configured — push skipped)
+═══════════════════════════════════════
+
+  Lint:  not available
+  Tests: skipped (require live Postgres + Redis; no code changes)
+
+  Commits made (local only):
+  1. 0edb951 feat: drop Grafana login wall and default to iocheck dashboard
+  2. c7a39c4 chore: update session logs
+
+  Files changed: 5  |  Insertions: 462  |  Deletions: 11
+═══════════════════════════════════════
+```
+
+To push, add a remote first — e.g. `git remote add origin <url> && git push -u origin master`.

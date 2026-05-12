@@ -292,3 +292,157 @@ Would you recommend deprecating bun tests that touch the DB/Redis?
 No — I'd keep them. They're the only thing that actually verifies the cache semantics that make this service interesting: tombstone-on-miss, hit-after-DB-delete, upsert-invalidates-cache. Mocking those out would just test the mocks; the k6 load test proves throughput, not correctness.
 
 The right move is making them work on a fresh clone (option 1 from before — compose-up in the `test` script with a remapped port), not deleting them. Deprecating integration tests because the local env is awkward usually means losing the one form of coverage that catches real bugs in this kind of service.
+
+## User
+
+Implement option 1.
+
+## Assistant
+
+Let me check what references the current ports before changing them.
+
+## Assistant
+
+> Bash: grep -nE "5432|6379|localhost|postgres://|redis://" README.md WRITEUP.md .env.example docker-compose...
+
+## Assistant
+
+> Read: /Users/carrein/Desktop/iocheck2/README.md
+
+## Assistant
+
+> Bash: grep -nE "5432|6379" WRITEUP.md CLAUDE.md kind-config.yaml manifests/iocheck/deployment.yaml manifes...
+
+## Assistant
+
+Now implementing. Remapping compose to `55432:5432` / `56379:6379` so it never collides with anything on the host, wiring `bun test` to bring it up, and updating all fallback URLs to match.
+
+## Assistant
+
+> Edit: /Users/carrein/Desktop/iocheck2/docker-compose.yml
+
+## Assistant
+
+> Read: /Users/carrein/Desktop/iocheck2/docker-compose.yml
+
+## Assistant
+
+> Edit: /Users/carrein/Desktop/iocheck2/docker-compose.yml
+
+## Assistant
+
+> Edit: /Users/carrein/Desktop/iocheck2/docker-compose.yml
+
+## Assistant
+
+Now wire `bun test` to bring compose up first, and update all fallback URLs.
+
+## Assistant
+
+> Edit: /Users/carrein/Desktop/iocheck2/package.json
+
+## Assistant
+
+> Edit: /Users/carrein/Desktop/iocheck2/.env.example
+
+## Assistant
+
+> Read: /Users/carrein/Desktop/iocheck2/.env.example
+
+## Assistant
+
+> Edit: /Users/carrein/Desktop/iocheck2/.env.example
+
+## Assistant
+
+> Edit: /Users/carrein/Desktop/iocheck2/tests/setup.ts
+
+## Assistant
+
+> Edit: /Users/carrein/Desktop/iocheck2/tests/lookup.test.ts
+
+## Assistant
+
+> Edit: /Users/carrein/Desktop/iocheck2/tests/admin.test.ts
+
+## Assistant
+
+> Edit: /Users/carrein/Desktop/iocheck2/src/db.ts
+
+## Assistant
+
+> Read: /Users/carrein/Desktop/iocheck2/src/db.ts
+
+## Assistant
+
+> Edit: /Users/carrein/Desktop/iocheck2/src/db.ts
+
+## Assistant
+
+> Edit: /Users/carrein/Desktop/iocheck2/src/cache.ts
+
+## Assistant
+
+> Read: /Users/carrein/Desktop/iocheck2/scripts/seed.ts
+
+## Assistant
+
+> Edit: /Users/carrein/Desktop/iocheck2/scripts/seed.ts
+
+## Assistant
+
+Now update README's "Local dev" section and the troubleshooting note.
+
+## Assistant
+
+> Edit: /Users/carrein/Desktop/iocheck2/README.md
+
+## Assistant
+
+> Read: /Users/carrein/Desktop/iocheck2/kind-config.yaml
+
+## Assistant
+
+> Edit: /Users/carrein/Desktop/iocheck2/README.md
+
+## Assistant
+
+Now run `bun test` end-to-end to verify.
+
+## Assistant
+
+> Bash: bun run test 2>&1 | tail -60
+
+## Assistant
+
+All 10 tests pass. Let me typecheck and then commit.
+
+## Assistant
+
+> Bash: bunx tsc --noEmit 2>&1 | tail -20
+
+## Assistant
+
+> Bash: git status --short && echo "---" && git diff --stat
+
+## Assistant
+
+> Bash: git add .env.example README.md docker-compose.yml package.json scripts/seed.ts src/cache.ts src/db.t...
+
+## Assistant
+
+> Bash: git commit -m "$(cat <<'EOF'
+fix: make bun test work out of the box
+
+A fresh clone could not run bun...
+
+## Assistant
+
+Done. `bun test` now works on a fresh clone with zero env plumbing:
+
+- Compose remapped to `:55432` / `:56379` — never collides with anything on default ports
+- `npm test` / `bun run test` runs `docker compose up -d postgres redis --wait && bun test`
+- All fallback URLs (`src/`, `scripts/`, `tests/`, `.env.example`) point at the remapped ports
+- README local-dev + troubleshooting updated
+
+Verified: **10 pass, 0 fail** on a fresh `bun run test`. Committed as `4debd96 fix: make bun test work out of the box`.
