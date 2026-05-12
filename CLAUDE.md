@@ -38,7 +38,6 @@ all downloaded or cluster-installed by `make up`.
   Kustomize overlays under `manifests/overlays/{cpu-hpa,rps-hpa}/`
 - `loadtest/` — k6 script, ConfigMap, Job
 - `dashboards/` — Grafana dashboard JSON, auto-imported by `make up`
-- `artifacts/sample/` — committed sample bench output for reference
 - `Dockerfile`, `docker-compose.yml`, `kind-config.yaml`, `Makefile`
 - `.claude/plans/iocheck-plan.md` + `iocheck-research.md` — durable design context;
   read these before re-deriving decisions or proposing changes to calibrated values

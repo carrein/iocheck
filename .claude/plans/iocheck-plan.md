@@ -290,8 +290,8 @@ Files: `WRITEUP.md`
 
 ### What landed
 - Phases A–J all done. Service, tests, Docker, k8s manifests, kube-prometheus,
-  KEDA, k6 load test, Makefile, README, WRITEUP, and a sample bench artifact
-  pair committed under `artifacts/sample/`.
+  KEDA, k6 load test, Makefile, README, and WRITEUP. Bench artifacts are
+  regenerated per run under `artifacts/<scenario>-<mode>-<ts>/`.
 - Assessor surface = 4 Make targets (`up`, `bench-cpu`, `bench-rps`, `down`).
   Confirmed end-to-end on a fresh cluster: `make up` (~6 min), bench-cpu and
   bench-rps each run a 5-min profile and write an artifact directory.
@@ -332,7 +332,7 @@ Files: `WRITEUP.md`
   doesn't materialise at this calibration; p99 stays < 20 ms in both
   scenarios. WRITEUP reframes accordingly.
 
-### Sample bench numbers (committed under `artifacts/sample/`)
+### Reference bench numbers (representative run, hot-mix workload)
 - **bench-cpu**: peak RPS 956.2, peak CPU 20.2%, replicas held at 2, peak p99
   5 ms. HPA never fired (CPU < 70%).
 - **bench-rps**: peak RPS 956.7, replicas climbed 2 → 9 → 3 within the window,
@@ -347,7 +347,8 @@ Files created/modified: ~40 — `src/*.ts`, `tests/*.test.ts`, `scripts/*`,
 `manifests/{namespace,iocheck/*,postgres/*,redis/*,monitoring/*,overlays/*}`,
 `loadtest/{script.js,job.yaml,configmap.yaml}`, `Dockerfile`,
 `docker-compose.yml`, `kind-config.yaml`, `Makefile`, `README.md`, `WRITEUP.md`,
-`dashboards/iocheck.json`, plus generated `artifacts/sample/*`.
+`dashboards/iocheck.json`. Bench artifacts are generated per run under
+`artifacts/<scenario>-<mode>-<ts>/` and are not committed.
 
 Key decisions worth recalling:
 - Bun.serve + Bun.sql + Bun.redis (no external drivers).
