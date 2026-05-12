@@ -1,7 +1,7 @@
 import { RedisClient } from "bun";
 import type { IOC, IOCType } from "./types";
 
-const url = process.env.REDIS_URL ?? "redis://localhost:6379";
+const url = process.env.REDIS_URL ?? "redis://localhost:56379";
 
 export const cache = new RedisClient(url, {
   connectionTimeout: 5000,

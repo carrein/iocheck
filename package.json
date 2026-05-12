@@ -9,7 +9,7 @@
   "scripts": {
     "dev": "bun --watch run src/server.ts",
     "start": "bun run src/server.ts",
-    "test": "bun test",
+    "test": "docker compose up -d postgres redis --wait && bun test",
     "seed": "bun run scripts/seed.ts",
     "capture": "bun run scripts/capture.ts"
   },

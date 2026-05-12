@@ -2,8 +2,8 @@ import { describe, expect, test, beforeAll, afterEach } from "bun:test";
 import { tdb, TEST_SCHEMA } from "./setup";
 import { RedisClient } from "bun";
 
-process.env.DATABASE_URL = `${process.env.DATABASE_URL ?? "postgres://iocheck:iocheckdev@localhost:5432/iocheck"}?options=-c%20search_path%3D${TEST_SCHEMA}`;
-process.env.REDIS_URL = process.env.REDIS_URL ?? "redis://localhost:6379";
+process.env.DATABASE_URL = `${process.env.DATABASE_URL ?? "postgres://iocheck:iocheckdev@localhost:55432/iocheck"}?options=-c%20search_path%3D${TEST_SCHEMA}`;
+process.env.REDIS_URL = process.env.REDIS_URL ?? "redis://localhost:56379";
 process.env.ADMIN_TOKEN = "test-token";
 
 const { upsert, authorize } = await import("../src/admin");

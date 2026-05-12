@@ -84,19 +84,21 @@ ScaledObject changes.
 
 ## Local dev (optional)
 
-Skip the cluster, iterate on the service alone:
+Skip the cluster, iterate on the service alone. Compose maps Postgres to host
+`:55432` and Redis to `:56379` so the dev stack never collides with whatever
+else is on the default ports.
 
 ```bash
-docker compose up -d            # postgres + redis on default ports
-ADMIN_TOKEN=dev DATABASE_URL=postgres://iocheck:iocheckdev@localhost:5432/iocheck \
-  REDIS_URL=redis://localhost:6379 \
-  bun run dev
+docker compose up -d            # postgres on :55432, redis on :56379
+ADMIN_TOKEN=dev bun run dev     # fallbacks already point at the compose ports
 ```
 
+`bun test` brings the compose backends up automatically (`docker compose up -d
+postgres redis --wait && bun test`), so a fresh clone passes with no env
+plumbing:
+
 ```bash
-DATABASE_URL=postgres://iocheck:iocheckdev@localhost:5432/iocheck \
-  REDIS_URL=redis://localhost:6379 \
-  bun test
+bun test
 ```
 
 ## Repo layout
@@ -131,7 +133,7 @@ markdown is committed.
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | `make up` stalls on `wait deployment/keda-operator` | Docker memory < 6 GiB | Raise Docker Desktop → Resources |
-| `make up` fails on Postgres init: port 5432 in use | A prior compose/Postgres on the host | `docker stop $(docker ps -q -f publish=5432)` or change host port |
+| `bun test` fails on `docker compose up`: port 55432/56379 in use | Another container already published one of these ports | `docker ps --filter publish=55432` (or 56379), stop the offender, retry |
 | `kubectl: command not found` (manual) | Use `./.bin/kubectl` — the Makefile vendors a pinned copy | n/a |
 | Grafana tab doesn't open during bench | `open`/`xdg-open` not available — visit `http://localhost:3000` directly | n/a |
 | CPU bench scales up unexpectedly | Per-request CPU higher than calibrated — see `WRITEUP.md` § Challenge 1 for re-tuning | adjust resource request in `manifests/iocheck/deployment.yaml` |

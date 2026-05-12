@@ -4,8 +4,8 @@ import { RedisClient } from "bun";
 
 // Direct imports of the lookup pipeline. We rebind db + cache to the test
 // instances by patching the env before the modules load via dynamic import.
-process.env.DATABASE_URL = `${process.env.DATABASE_URL ?? "postgres://iocheck:iocheckdev@localhost:5432/iocheck"}?options=-c%20search_path%3D${TEST_SCHEMA}`;
-process.env.REDIS_URL = process.env.REDIS_URL ?? "redis://localhost:6379";
+process.env.DATABASE_URL = `${process.env.DATABASE_URL ?? "postgres://iocheck:iocheckdev@localhost:55432/iocheck"}?options=-c%20search_path%3D${TEST_SCHEMA}`;
+process.env.REDIS_URL = process.env.REDIS_URL ?? "redis://localhost:56379";
 
 const { lookup } = await import("../src/lookup");
 const cacheMod = await import("../src/cache");

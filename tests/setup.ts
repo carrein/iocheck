@@ -6,7 +6,7 @@ import { beforeAll, afterAll } from "bun:test";
 import { SQL } from "bun";
 
 const DATABASE_URL =
-  process.env.DATABASE_URL ?? "postgres://iocheck:iocheckdev@localhost:5432/iocheck";
+  process.env.DATABASE_URL ?? "postgres://iocheck:iocheckdev@localhost:55432/iocheck";
 
 export const TEST_SCHEMA = `test_${crypto.randomUUID().replace(/-/g, "").slice(0, 8)}`;
 

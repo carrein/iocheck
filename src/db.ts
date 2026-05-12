@@ -1,7 +1,7 @@
 import { SQL } from "bun";
 import type { IOC, IOCType } from "./types";
 
-const url = process.env.DATABASE_URL ?? "postgres://iocheck:iocheckdev@localhost:5432/iocheck";
+const url = process.env.DATABASE_URL ?? "postgres://iocheck:iocheckdev@localhost:55432/iocheck";
 
 export const db = new SQL({
   url,

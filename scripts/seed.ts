@@ -11,7 +11,7 @@
 import { SQL } from "bun";
 
 const DATABASE_URL =
-  process.env.DATABASE_URL ?? "postgres://iocheck:iocheckdev@localhost:5432/iocheck";
+  process.env.DATABASE_URL ?? "postgres://iocheck:iocheckdev@localhost:55432/iocheck";
 
 const HOT_COUNT = 100;
 const TOTAL_COUNT = 10_000;

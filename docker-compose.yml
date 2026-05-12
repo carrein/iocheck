@@ -8,8 +8,9 @@ services:
       POSTGRES_DB: iocheck
       POSTGRES_USER: iocheck
       POSTGRES_PASSWORD: iocheckdev
+    # Host port 55432 to stay clear of any other Postgres on the default :5432.
     ports:
-      - "5432:5432"
+      - "55432:5432"
     volumes:
       - ./manifests/postgres/init:/docker-entrypoint-initdb.d:ro
       - pgdata:/var/lib/postgresql/data
@@ -29,8 +30,9 @@ services:
       - allkeys-lru
       - --save
       - ""
+    # Host port 56379 to stay clear of any other Redis on the default :6379.
     ports:
-      - "6379:6379"
+      - "56379:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 2s
