@@ -40,15 +40,25 @@ CLUSTER    := iocheck
 NAMESPACE  := iocheck
 PROM_NS    := monitoring
 
+# Host ports for port-forwards. Grafana moved off the popular :3000 default
+# (collides with React/Node dev servers) and onto :3030. The in-cluster
+# Grafana Service is unchanged on :3000 — only the host side changed.
+GRAFANA_PORT    ?= 3030
+PROMETHEUS_PORT ?= 9090
+
 # Background port-forward helpers --------------------------------------------------
+# Supervised via scripts/pf.sh: kubectl port-forward attaches to one endpoint
+# pod when launched and dies if that pod is replaced (rollout, eviction).
+# pf.sh re-runs kubectl on exit so the host port survives a Grafana rollout
+# (e.g. .monitoring's anonymous-config restart) without manual intervention.
 define _start_pf
 	@mkdir -p $(PIDS_DIR)
 	@if [ -f $(PIDS_DIR)/$(1).pid ] && kill -0 $$(cat $(PIDS_DIR)/$(1).pid) 2>/dev/null; then \
 	  echo "port-forward $(1) already running (pid $$(cat $(PIDS_DIR)/$(1).pid))"; \
 	else \
-	  echo "starting port-forward $(1) → $(2):$(3)"; \
-	  ( $(KUBECTL) port-forward -n $(4) svc/$(5) $(2):$(3) >$(PIDS_DIR)/$(1).log 2>&1 & echo $$! >$(PIDS_DIR)/$(1).pid ); \
-	  for i in $$(seq 1 20); do nc -z 127.0.0.1 $(2) 2>/dev/null && break; sleep 0.25; done; \
+	  echo "starting supervised port-forward $(1) → 127.0.0.1:$(2) → svc/$(5):$(3)"; \
+	  ( bash $(CURDIR)/scripts/pf.sh $(KUBECTL) $(4) $(5) $(2):$(3) >$(PIDS_DIR)/$(1).log 2>&1 & echo $$! >$(PIDS_DIR)/$(1).pid ); \
+	  for i in $$(seq 1 40); do nc -z 127.0.0.1 $(2) 2>/dev/null && break; sleep 0.25; done; \
 	fi
 endef
 
@@ -95,8 +105,8 @@ up: .bootstrap .image .cluster .keda .monitoring .stack .seed .grafana-dashboard
 	@echo "   make down            (tear down)"
 	@echo ""
 	@echo " Live dashboards (started during bench-*):"
-	@echo "   Grafana    http://localhost:3000   (anonymous, lands on iocheck dashboard)"
-	@echo "   Prometheus http://localhost:9090"
+	@echo "   Grafana    http://localhost:$(GRAFANA_PORT)   (anonymous, lands on iocheck dashboard)"
+	@echo "   Prometheus http://localhost:$(PROMETHEUS_PORT)"
 	@echo "================================================================"
 
 .PHONY: down
@@ -232,8 +242,25 @@ bench-all: ## Run cpu/rps4/rps8 sequentially, emit comparison table
 	@# after the kube-prometheus apply above, otherwise it would be clobbered.
 	@echo "configuring Grafana for anonymous access..."
 	@$(KUBECTL) apply -f $(CURDIR)/manifests/monitoring/grafana-config.yaml
+	@# Provision iocheck dashboard the kube-prometheus way: a ConfigMap
+	@# mounted at /grafana-dashboard-definitions/0/iocheck/ that Grafana's
+	@# file provisioner picks up on startup. Survives any pod restart, unlike
+	@# the prior /api/dashboards/db import (which lives in SQLite emptyDir).
+	@echo "provisioning iocheck dashboard via ConfigMap..."
+	@$(KUBECTL) -n $(PROM_NS) create configmap grafana-dashboard-iocheck \
+	  --from-file=iocheck.json=$(CURDIR)/dashboards/iocheck.json \
+	  --dry-run=client -o yaml | $(KUBECTL) apply -f -
+	@$(KUBECTL) -n $(PROM_NS) patch deployment grafana \
+	  --type=strategic --patch-file=$(CURDIR)/manifests/monitoring/grafana-iocheck-patch.yaml
+	@# Use `rollout status` (not `wait --for=Available`): Available flips
+	@# True as soon as the new pod is Ready, while the old pod is still in
+	@# Endpoints, so kubectl port-forward could attach to the doomed pod
+	@# and lose access mid-demo. rollout status waits for the rollout to
+	@# fully complete (old pods gone) — guarantees port-forward attaches
+	@# to a stable pod.
 	@$(KUBECTL) -n $(PROM_NS) rollout restart deployment/grafana
-	@$(KUBECTL) -n $(PROM_NS) wait --for=condition=Available --timeout=300s deployment/grafana deployment/prometheus-operator
+	@$(KUBECTL) -n $(PROM_NS) rollout status deployment/grafana --timeout=300s
+	@$(KUBECTL) -n $(PROM_NS) wait --for=condition=Available --timeout=60s deployment/prometheus-operator
 	@$(KUBECTL) -n $(PROM_NS) rollout status statefulset/prometheus-k8s --timeout=300s
 
 .PHONY: .stack
@@ -261,21 +288,14 @@ bench-all: ## Run cpu/rps4/rps8 sequentially, emit comparison table
 	@$(KUBECTL) -n $(NAMESPACE) rollout status deployment/iocheck --timeout=180s
 
 .PHONY: .grafana-dashboard
+# Historical name kept so `make up`'s phony list doesn't change. The iocheck
+# dashboard is now provisioned by .monitoring via ConfigMap mount (durable
+# across pod restarts), and grafana.ini's default_home_dashboard_path sets
+# it as home for anonymous viewers — so this target only needs to start
+# the port-forward and print the URL.
 .grafana-dashboard: .monitoring
-	@$(call _start_pf,grafana,3000,3000,$(PROM_NS),grafana)
-	@echo "importing iocheck dashboard into Grafana..."
-	@bash -c '\
-	  body=$$(bun -e "const d=await Bun.file(\"dashboards/iocheck.json\").json(); console.log(JSON.stringify({dashboard:{...d,id:null,uid:\"iocheck\"},overwrite:true,inputs:[],folderId:0}))"); \
-	  curl -fsS -u admin:admin -H "Content-Type: application/json" \
-	    -d "$$body" \
-	    http://127.0.0.1:3000/api/dashboards/db >/dev/null && \
-	  echo "dashboard imported → http://localhost:3000/d/iocheck"'
-	@# Set the iocheck dashboard as the org's home dashboard so the root URL
-	@# (and the anonymous landing page) goes straight to it.
-	@curl -fsS -u admin:admin -X PUT -H "Content-Type: application/json" \
-	  -d '{"homeDashboardUID":"iocheck"}' \
-	  http://127.0.0.1:3000/api/org/preferences >/dev/null
-	@echo "set iocheck as Grafana home dashboard"
+	@$(call _start_pf,grafana,$(GRAFANA_PORT),3000,$(PROM_NS),grafana)
+	@echo "iocheck dashboard → http://localhost:$(GRAFANA_PORT)/d/iocheck (provisioned via ConfigMap)"
 
 .PHONY: _bench
 # Workload knob: MISS_RATE (single source of truth).
@@ -340,8 +360,8 @@ _bench:
 
 	# Start Prometheus + Grafana port-forwards.
 	@echo "[3/7] starting port-forwards..."
-	@$(call _start_pf,prometheus,9090,9090,$(PROM_NS),prometheus-k8s)
-	@$(call _start_pf,grafana,3000,3000,$(PROM_NS),grafana)
+	@$(call _start_pf,prometheus,$(PROMETHEUS_PORT),9090,$(PROM_NS),prometheus-k8s)
+	@$(call _start_pf,grafana,$(GRAFANA_PORT),3000,$(PROM_NS),grafana)
 
 	# Wait for metrics-server to publish CPU for every iocheck pod before we
 	# start hammering. Without this gate the freshly-created HPA spends its
@@ -371,7 +391,7 @@ _bench:
 	     $(CURDIR)/loadtest/job.yaml | $(KUBECTL) apply -f -
 
 	@echo ""
-	@echo "    Grafana: http://localhost:3000/d/iocheck?refresh=5s&from=now-2m&to=now%2B15m"
+	@echo "    Grafana: http://localhost:$(GRAFANA_PORT)/d/iocheck?refresh=5s&from=now-2m&to=now%2B15m"
 	@echo "    (anonymous access — no login required)"
 	@echo ""
 

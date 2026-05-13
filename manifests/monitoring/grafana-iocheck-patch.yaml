@@ -1,0 +1,32 @@
+# Strategic-merge patch onto kube-prometheus's grafana Deployment. Adds a
+# volume + mount so the iocheck dashboard is provisioned the same way every
+# other kube-prometheus dashboard is: a ConfigMap mounted at
+# /grafana-dashboard-definitions/0/<name>/, picked up by Grafana's file
+# provisioner config on startup.
+#
+# Why this beats the prior API-import approach: API-imported dashboards live
+# in Grafana's SQLite under /var/lib/grafana, which is an emptyDir — wiped
+# on every pod restart (rollout, eviction, kind node restart). The
+# ConfigMap mount survives any pod restart because the data lives in the
+# K8s API, not the pod filesystem.
+#
+# Apply with: kubectl -n monitoring patch deployment grafana \
+#   --type=strategic --patch-file=manifests/monitoring/grafana-iocheck-patch.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grafana
+  namespace: monitoring
+spec:
+  template:
+    spec:
+      containers:
+        - name: grafana
+          volumeMounts:
+            - mountPath: /grafana-dashboard-definitions/0/iocheck
+              name: grafana-dashboard-iocheck
+              readOnly: false
+      volumes:
+        - name: grafana-dashboard-iocheck
+          configMap:
+            name: grafana-dashboard-iocheck

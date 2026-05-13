@@ -1,6 +1,8 @@
-# Overrides kube-prometheus's grafana-config Secret to disable the login wall.
-# Applied after `kubectl apply -f kube-prometheus/manifests` so it wins; the
-# Grafana deployment is then rolled to pick up the new grafana.ini.
+# Overrides kube-prometheus's grafana-config Secret to disable the login wall
+# and point the default home dashboard at the iocheck dashboard JSON that
+# grafana-iocheck-patch.yaml mounts. Applied after
+# `kubectl apply -f kube-prometheus/manifests` so it wins; the Grafana
+# deployment is then rolled to pick up the new grafana.ini.
 #
 # auth.anonymous.enabled + disable_login_form together mean a visitor lands
 # directly on the home dashboard with no login prompt. Admin role removes the
@@ -8,8 +10,10 @@
 # panel inspect). Acceptable here because the cluster is single-user and lives
 # only on the assessor's laptop.
 #
-# The home dashboard itself is set via /api/org/preferences after the iocheck
-# dashboard is imported (see Makefile `.grafana-dashboard`).
+# default_home_dashboard_path sets the home dashboard for anonymous viewers
+# without writing to /api/org/preferences (which lives in SQLite emptyDir and
+# dies on pod restart). The file path matches the volumeMount that
+# grafana-iocheck-patch.yaml adds.
 apiVersion: v1
 kind: Secret
 metadata:
@@ -36,3 +40,6 @@ stringData:
 
     [users]
     default_theme = dark
+
+    [dashboards]
+    default_home_dashboard_path = /grafana-dashboard-definitions/0/iocheck/iocheck.json

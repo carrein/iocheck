@@ -12,6 +12,7 @@ WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY package.json ./
 COPY src ./src
+COPY scripts ./scripts
 USER bun
 ENV NODE_ENV=production
 EXPOSE 3000
