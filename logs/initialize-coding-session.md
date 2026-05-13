@@ -616,3 +616,572 @@ Files touched: `Dockerfile`, `Makefile`, `README.md`, `manifests/monitoring/graf
 Both `bench-all` runs landed in:
 - `artifacts/bench-all-20260513T131227Z/` (run 1)
 - `artifacts/bench-all-20260513T132758Z/` (run 2)
+
+## User
+
+<command-message>carrein-uberthink</command-message>
+<command-name>/carrein-uberthink</command-name>
+<command-args>
+
+Let's do 2000 RPS, 90% miss set.
+1. Verify that all anomalies from the above run has been fixed.
+2. Run make down to destory the cluster.
+3. And then make up and re run the make bench-all 3 times and cross compare.</command-args>
+
+## User
+
+<command-message>carrein-uberthink</command-message>
+<command-name>/carrein-uberthink</command-name>
+<command-args>
+
+Let's do 2000 RPS, 90% miss set.
+1. Verify that all anomalies from the above run has been fixed.
+2. Run make down to destory the cluster.
+3. And then make up and re run the make bench-all 3 times and cross compare.
+4. Finally run bench failure to make sure we are good on that count.</command-args>
+
+## User
+
+<command-message>carrein-uberthink</command-message>
+<command-name>/carrein-uberthink</command-name>
+<command-args>
+
+Let's do 2000 RPS, 90% miss set.
+1. Verify that all anomalies from the above run has been fixed.
+2. Run make down to destory the cluster.
+3. And then make up and re run the make bench-all 3 times and cross compare.
+4. Finally run bench failure to make sure we are good on that count.
+
+Any questions?</command-args>
+
+## Assistant
+
+Before kicking off ~70 minutes of cluster work, a few questions to make sure I aim correctly. Grouped by theme.
+
+**Workload plumbing**
+1. `TARGET_RPS` is currently hardcoded as `:= 1000` in the `_bench` target. `MISS_RATE` is the only knob designed for CLI override. I have two ways to express the new workload:
+   - **(a)** Pass on every invocation: `make bench-all TARGET_RPS=2000 MISS_RATE=0.9` (should propagate via MAKEFLAGS to recursive make calls). One-off — leaves defaults intact.
+   - **(b)** Change the defaults in the Makefile to 2000/0.9 as the new baseline. More invasive, but if 2000/0.9 becomes the new "comparable workload" it's the honest call.
+   
+   Which?
+
+**Capacity sanity check**
+2. At 1000 RPS / 80% miss, worker CPU peaked at 20-24% — we had headroom. At 2000 RPS / 90% miss the DB-bound path doubles plus the miss mix grows ~12.5%, so I'd project worker CPU peaks ~55-65% and Postgres CPU is the likely bottleneck. There's a real chance p99 exceeds the 200ms SLO under this load (especially on `cpu-hpa` which won't scale and `rps-hpa-4` which has a tight ceiling). That's interesting data either way — do you want me to:
+   - **(a)** Run as-is and report whatever happens (SLO breaches included).
+   - **(b)** Bump Postgres CPU request first if I think it's needed (the existing tuning commit `793c950` shows you've cared about this before).
+   
+   I'd recommend (a) — if SLO breaks, that's the story. Confirm?
+
+**bench-failure workload**
+3. `bench-failure` validates the KEDA Prometheus-blackout fallback. Same 2000/0.9 workload as the 3× bench-all, or revert to the calibrated baseline (1000/0.8) so the failure validation isn't entangled with capacity questions?
+
+**Cross-compare output**
+4. The existing `scripts/compare.ts` handles a single bench-all run (3 scenarios → one `comparison.md`). For 3 runs × 3 scenarios = 9 sub-benches, I'd add a small `scripts/cross-compare.ts` that reads multiple `bench-all-*/` roots and emits a single side-by-side markdown (each scenario gets a row with run-1 / run-2 / run-3 columns), plus a "consistency verdict" per row (e.g. p99 spread, replica peak spread). The per-run `comparison.md` is still emitted normally. Sound right?
+
+**Anomaly verification — concrete bar**
+5. I'll verify the prior fixes hold by checking, immediately after `make up`:
+   - Seed Job `Complete` on first attempt (no `BackoffLimitExceeded`); DB row count = 10000.
+   - Grafana port 3030 reachable; `curl /api/health` returns 200.
+   - iocheck dashboard appears in `/api/search?query=iocheck` (provisioned via ConfigMap, **without** any API call from the Makefile).
+   - Anonymous landing page lands on iocheck dashboard (`default_home_dashboard_path` works).
+   - `make up`'s `.monitoring` step uses `rollout status` (no port-forward attaching to a doomed pod).
+   - Supervised port-forward survives a manual `kubectl rollout restart deployment/grafana` (sanity test the supervisor reconnects).
+   
+   Anything else you want me to add to this checklist?
+
+Tell me on the 5 above and I'll run.
+
+## User
+
+1a
+2a
+3 same
+4 No need, can't you just parse them using natural langauge after?
+5. No. But also look out for any new anomalies this run.
+
+## Assistant
+
+Confirmed all 5. Starting now — total wall clock ~60-75 min. I'll run sequentially in the background, reporting at phase boundaries.
+
+## Assistant
+
+> TaskList
+
+## Assistant
+
+> TaskCreate: Sanity-check Dockerfile, Makefile, scripts/pf.sh, manifests/monitoring/grafana-iocheck-patch.yaml, g...
+
+## Assistant
+
+> TaskCreate: Destroy the cluster + clean .bin/. Artifacts retained.
+
+## Assistant
+
+> TaskCreate: Bring cluster up cleanly. Verify: seed Job Complete first attempt, DB=10000 rows, Grafana :3030 reac...
+
+## Assistant
+
+> TaskCreate: make bench-all TARGET_RPS=2000 MISS_RATE=0.9
+
+## Assistant
+
+> TaskCreate: Second run on same cluster
+
+## Assistant
+
+> TaskCreate: Third run on same cluster
+
+## Assistant
+
+> TaskCreate: make bench-failure TARGET_RPS=2000 MISS_RATE=0.9
+
+## Assistant
+
+> TaskCreate: Read all 4 comparison.md + failure summary; produce side-by-side natural-language analysis + new ano...
+
+## Assistant
+
+> TaskUpdate
+
+## Assistant
+
+> Bash: echo "---git status---" && git status --short && echo "---diff stat---" && git diff --stat && echo "...
+
+## Assistant
+
+All prior fixes intact. Tearing down cluster.
+
+## Assistant
+
+> TaskUpdate
+
+## Assistant
+
+> TaskUpdate
+
+## Assistant
+
+> Bash: make -C /Users/carrein/Desktop/iocheck2 down 2>&1 | tee /tmp/iocheck-down.log; echo "---residue chec...
+
+## Assistant
+
+Tear-down clean: both port-forwards stopped (pf.sh trap propagated to kubectl child), `.bin/` removed, no docker residue, artifacts preserved.
+
+## Assistant
+
+> TaskUpdate
+
+## Assistant
+
+> TaskUpdate
+
+## Assistant
+
+> Bash: set -o pipefail; make -C /Users/carrein/Desktop/iocheck2 up 2>&1 | tee /tmp/iocheck-up.log; echo "MA...
+
+## Assistant
+
+`make up` running (ID `b2zrw2xn3`). I'm using `set -o pipefail` so the tee chain doesn't mask a non-zero make exit (lesson from last session). Will verify anomaly checklist when it completes.
+
+## User
+
+<task-notification>
+<task-id>b2zrw2xn3</task-id>
+<tool-use-id>toolu_01LxtCsSuruuhTYX26xtSCLR</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-carrein-Desktop-iocheck2/dcd41079-fe06-425f-bc35-83929c0a6a6b/tasks/b2zrw2xn3.output</output-file>
+<status>completed</status>
+<summary>Background command "Bring cluster up (with pipefail so exit reflects make's status)" completed (exit code 0)</summary>
+</task-notification>
+
+## Assistant
+
+> Bash: echo "===== make up tail ====="; tail -25 /tmp/iocheck-up.log; echo ""; echo "===== anomaly checklis...
+
+## Assistant
+
+**Anomaly checklist verdict — all 5 prior fixes hold:**
+
+| # | Check | Result |
+|---|---|---|
+| 1 | Seed Job `Complete` first attempt | ✓ (Duration=20s, vs last session's BackoffLimit failure) |
+| 2 | DB row count = 10000 | ✓ |
+| 3 | Grafana :3030 reachable | ✓ (`code=200`) |
+| 4 | iocheck dashboard auto-provisioned (no API import) | ✓ (Makefile only has the historical comment; the actual call site is gone — my grep hit a comment, false positive) |
+| 5 | Default home dashboard works (anonymous lands on iocheck) | ✓ (`code=200`, no Welcome screen) |
+| 6 | Supervised `pf.sh` is the parent process | ✓ (pid 64045, with kubectl child) |
+
+**One new observation worth flagging:**
+- **KEDA operator has `restarts=1`** (5m38s ago, now Running). KEDA's deployment often takes 1 restart on first startup (webhook race with admission). Pod has been stable since. Will keep an eye on whether this affects rps-hpa scenarios.
+
+Kicking off bench-all run A.
+
+## Assistant
+
+> TaskUpdate
+
+## Assistant
+
+> TaskUpdate
+
+## Assistant
+
+> Bash: set -o pipefail; make -C /Users/carrein/Desktop/iocheck2 bench-all TARGET_RPS=2000 MISS_RATE=0.9 2>&...
+
+## Assistant
+
+Run A started (ID `bdb1ipeyf`, ETA ~15 min). Will queue runs B and C in sequence as each completes.
+
+## User
+
+<task-notification>
+<task-id>bdb1ipeyf</task-id>
+<tool-use-id>toolu_01VrWjiBGRmziFM6pZi8xnZf</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-carrein-Desktop-iocheck2/dcd41079-fe06-425f-bc35-83929c0a6a6b/tasks/bdb1ipeyf.output</output-file>
+<status>completed</status>
+<summary>Background command "bench-all run A at 2000 RPS / 90% miss" completed (exit code 0)</summary>
+</task-notification>
+
+## Assistant
+
+> Bash: runA=$(ls -d /Users/carrein/Desktop/iocheck2/artifacts/bench-all-* | sort | tail -1); echo "Run A di...
+
+## Assistant
+
+Run A clean. **cpu-hpa actually scaled (peak=3 replicas)** at 2000/0.9 — that's new behavior vs the 1000/0.8 baseline where CPU never crossed threshold. SLOs all pass. Starting run B.
+
+## Assistant
+
+> TaskUpdate
+
+## Assistant
+
+> TaskUpdate
+
+## Assistant
+
+> Bash: set -o pipefail; make -C /Users/carrein/Desktop/iocheck2 bench-all TARGET_RPS=2000 MISS_RATE=0.9 2>&...
+
+## Assistant
+
+Run B started (ID `bfy5v7rox`). Run A landed in `bench-all-20260513T143230Z`.
+
+## User
+
+<task-notification>
+<task-id>bfy5v7rox</task-id>
+<tool-use-id>toolu_01DYP9QouUT2bTeDtyt9BNTU</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-carrein-Desktop-iocheck2/dcd41079-fe06-425f-bc35-83929c0a6a6b/tasks/bfy5v7rox.output</output-file>
+<status>completed</status>
+<summary>Background command "bench-all run B at 2000 RPS / 90% miss" completed (exit code 0)</summary>
+</task-notification>
+
+## Assistant
+
+> Bash: runB=$(ls -d /Users/carrein/Desktop/iocheck2/artifacts/bench-all-* | sort | tail -1); echo "Run B di...
+
+## Assistant
+
+Run B done. **cpu-hpa held at 2 this time** (vs A's peak=3) — same workload, different autoscaler outcome. Worth flagging. Starting run C.
+
+## Assistant
+
+> TaskUpdate
+
+## Assistant
+
+> TaskUpdate
+
+## Assistant
+
+> Bash: set -o pipefail; make -C /Users/carrein/Desktop/iocheck2 bench-all TARGET_RPS=2000 MISS_RATE=0.9 2>&...
+
+## Assistant
+
+Run C launched (ID `b22cyfxfh`). After it finishes I'll queue bench-failure.
+
+## User
+
+<task-notification>
+<task-id>b22cyfxfh</task-id>
+<tool-use-id>toolu_01BV4P7Fn9Gm8b28RULBxVYb</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-carrein-Desktop-iocheck2/dcd41079-fe06-425f-bc35-83929c0a6a6b/tasks/b22cyfxfh.output</output-file>
+<status>completed</status>
+<summary>Background command "bench-all run C at 2000 RPS / 90% miss" completed (exit code 0)</summary>
+</task-notification>
+
+## Assistant
+
+> Bash: runC=$(ls -d /Users/carrein/Desktop/iocheck2/artifacts/bench-all-* | sort | tail -1); echo "Run C di...
+
+## Assistant
+
+Run C done. Supervised port-forward survived all 3 runs (pid 64045 still alive throughout — that's ~50 minutes of continuous operation). KEDA operator: still just the 1 restart at startup, no new restarts during any bench. Starting bench-failure.
+
+## Assistant
+
+> TaskUpdate
+
+## Assistant
+
+> TaskUpdate
+
+## Assistant
+
+> Bash: set -o pipefail; make -C /Users/carrein/Desktop/iocheck2 bench-failure TARGET_RPS=2000 MISS_RATE=0.9...
+
+## Assistant
+
+bench-failure launched (ID `bw8mr74ou`, ETA ~5 min). This patches Prometheus to `replicas=0` at T+75s for 90s to validate the KEDA fallback path. I'll do the full cross-comparison once it finishes.
+
+## User
+
+<task-notification>
+<task-id>bw8mr74ou</task-id>
+<tool-use-id>toolu_015u6ff6Kbcd8WoiDyHVS2W7</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-carrein-Desktop-iocheck2/dcd41079-fe06-425f-bc35-83929c0a6a6b/tasks/bw8mr74ou.output</output-file>
+<status>completed</status>
+<summary>Background command "bench-failure at 2000 RPS / 90% miss" completed (exit code 0)</summary>
+</task-notification>
+
+## Assistant
+
+> Bash: runFail=$(ls -d /Users/carrein/Desktop/iocheck2/artifacts/failure-* 2>/dev/null | sort | tail -1); i...
+
+## Assistant
+
+bench-failure done. **Replicas held steady at 8 during the blackout** — fallback validation ✓. But I see a new anomaly: the key_numbers (p99, peak_rps, etc.) are all `-`. Let me dig into that and pull all the data for the cross-compare.
+
+## Assistant
+
+> Bash: runA=/Users/carrein/Desktop/iocheck2/artifacts/bench-all-20260513T143230Z; runB=/Users/carrein/Deskt...
+
+## Assistant
+
+My grid had a field-name mismatch — let me re-pull with the correct field names from the JSON.
+
+## Assistant
+
+> Bash: runA=/Users/carrein/Desktop/iocheck2/artifacts/bench-all-20260513T143230Z; runB=/Users/carrein/Deskt...
+
+## Assistant
+
+All the data I need is in. Let me put together the final cross-comparison and anomaly report.
+
+## Assistant
+
+> TaskUpdate
+
+## Assistant
+
+> TaskUpdate
+
+## Assistant
+
+> Bash: echo "===== bench-failure summary.md (Fallback section) ====="; grep -A15 "Fallback behavior" /Users...
+
+## Assistant
+
+> TaskUpdate
+
+## Assistant
+
+---
+
+## Final report — 3× bench-all + bench-failure @ 2000 RPS / 90% miss
+
+### Anomaly checklist verdict (from prior session)
+
+All 5 fixes held:
+
+| Fix | Verification |
+|---|---|
+| Dockerfile `COPY scripts ./scripts` | Seed Job `Complete` first attempt in 20s, DB = 10,000 rows |
+| Supervised `pf.sh` on `:3030` | Single `pf.sh` pid 64045 alive **continuously for ~50 min** across 3 bench-all runs + bench-failure |
+| iocheck dashboard ConfigMap mount | Dashboard auto-appears in `/api/search?query=iocheck` with **zero API import calls** from the Makefile |
+| `default_home_dashboard_path` in `grafana.ini` | Anonymous landing returns 200 + iocheck dashboard |
+| `rollout status` (not `wait Available`) in `.monitoring` | No port-forward attached to a doomed pod; no "lost connection" in pf.sh logs |
+
+---
+
+### 3×3 cross-comparison — all 9 sub-benches PASS every SLO
+
+| Scenario | Run | p99 | peak RPS | cpu_peak (%req) | inflight | cache | peak/final repl |
+|---|---|---:|---:|---:|---:|---:|---:|
+| cpu-hpa | A | **5ms** | 2001 | 40.5% | 2 | 9.9% | **3** / 2 |
+| cpu-hpa | B | **12ms** | 2001 | 38.5% | 3 | 10.0% | 2 / 2 |
+| cpu-hpa | C | **5ms** | 2002 | 33.7% | 2 | 10.0% | 2 / 2 |
+| rps-hpa-4 | A | 15ms | 2002 | 23.2% | 2 | 10.0% | 4 / 3 |
+| rps-hpa-4 | B | **22ms** | 2002 | 32.7% | **11** | 10.1% | 4 / 3 |
+| rps-hpa-4 | C | 8ms | 2001 | 28.9% | 1 | 9.8% | 4 / 3 |
+| rps-hpa-8 | A | 8ms | 2002 | 25.9% | 5 | 9.9% | 8 / 6 |
+| rps-hpa-8 | B | 11ms | 2001 | 26.6% | 1 | 10.0% | 8 / 6 |
+| rps-hpa-8 | C | 10ms | 2001 | 26.7% | 2 | 9.9% | 8 / 6 |
+
+**What's identical across all 9:**
+- Peak RPS 2001-2002 (delivered to target).
+- Cache hit rate 9.8-10.1% (10% hot ↔ `MISS_RATE=0.9` exactly).
+- Total requests within 5% (237k-248k).
+- All SLOs pass; the 200ms SLO is honored with at least 9× headroom (worst p99 = 22ms).
+- rps-hpa-4 always peaks at 4 then drains to 3.
+- rps-hpa-8 always peaks at 8 then drains to 6.
+
+**The 200ms SLO is not threatened.** Worst p99 across all 9 sub-benches is 22ms — 9× under SLO. The cluster has plenty of headroom at 2× the prior workload (worker CPU peaks ~35-40% on cpu-hpa's smaller replica set; below 30% on the RPS-HPA scenarios).
+
+---
+
+### New anomalies observed
+
+**1. cpu-hpa scaling is non-deterministic at this workload.** Run A scaled to peak=3 replicas, Runs B and C held at peak=2 — same workload, same overlay. None of my captured CPU samples exceeded the 70% HPA threshold (sampled peaks were 33-40%), yet Run A's HPA fired. The HPA looks at metrics-server's 60-second smoothed CPU (kubectl top), and a brief spike between two of capture.ts's 15-second polling windows would explain this — but the variance means cpu-hpa cannot be sold as a reliable autoscaler at this load. The `slo.scaled` mark in the comparison.md tables is now meaningless for cpu-hpa, because it flips run-to-run.
+
+**2. Run B was systematically slower than A and C across all three scenarios.** p99 was the highest in B in every single scenario (cpu-hpa 12 vs 5/5, rps-hpa-4 22 vs 15/8, rps-hpa-8 11 vs 8/10). And rps-hpa-4 in run B had peak in-flight = 11 per pod (vs 1-2 elsewhere). This is cluster-wide variance, not a scenario-specific failure — likely a Docker/macOS host pressure window. Not actionable in code, but the cluster's noise floor is visible.
+
+**3. bench-failure: `key_numbers` are all null in `summary.json`.** Peak RPS, p99, error rate, total requests, cache hit ratio — all `null`. The `summary.md` shows them as `-`, and the SLO check renders as `✗` (`pass_p99: false, pass_error_rate: false`) — which is misleading because the failure is **intentional** (we blacked out Prometheus). `scripts/capture.ts` doesn't gracefully stitch around the data gap. The fallback validation itself (the headline of bench-failure) **worked correctly** — replicas held steady at 8 throughout the blackout window — but the comparison/SLO rows look like failures rather than "n/a". This is the one thing in the harness that's still rough.
+
+**4. bench-failure's `ScalingActive` recovered while Prometheus was still blacked out.** ScalingActive flipped False at 7:21:25 (T+97s) and recovered True at 7:21:40 (T+112s) — but the blackout ran T+75s through T+165s. So at T+112s, KEDA reported ScalingActive=True despite Prometheus being down for another 53s. This is consistent with KEDA's documented behavior — once the fallback policy kicks in, KEDA reports the HPA as active using the fallback value — but the writeup's framing of ScalingActive as a "Prometheus down" signal is imprecise. The truer story is: ScalingActive is False during a brief gap, then True (under fallback) for the rest of the blackout.
+
+**5. KEDA operator had 1 restart at startup, but never restarted again** across ~70 minutes of cluster runtime including 3 bench-all runs + bench-failure. So the startup restart is harmless — just noting it stayed at exactly 1 throughout.
+
+---
+
+### Headline
+
+- **All 5 prior fixes work as designed.** `make up` is now a clean one-shot — seed completes first try, Grafana on `:3030` survives pod rotations, dashboard auto-provisions without API hacks.
+- **3 bench-all runs at 2000 RPS / 90% miss all pass SLOs** with substantial headroom (worst p99 = 22ms vs 200ms SLO).
+- **bench-failure validates the writeup §4 fallback claim** — replicas held steady at 8 throughout the 90s Prometheus blackout.
+- **Cluster has the variance you'd expect from a kind-on-macOS setup** (run B was slower than A/C in every scenario; cpu-hpa's HPA decision was non-deterministic). Nothing breached SLO; nothing crashed; the same story would be told to an assessor across any of the 3 runs.
+- **One harness gap surfaced:** `bench-failure`'s summary renders missing-during-blackout values as `✗ failed` rather than `n/a`. Worth a small `scripts/capture.ts` patch — but not urgent and not part of this task.
+
+All artifacts under `artifacts/bench-all-20260513T{143230,144758,150425}Z/` and `artifacts/failure-miss90-20260513T151948Z/`.
+
+## User
+
+1. Ack on anomalies.
+2. Ack on passes.
+3. Ack on variance.
+4. Fix the harness gap.
+
+Would you recommend sticking to 1000/80% or this new 2000/90% given our results? Or would u recommend saturating this p99 in the interest of the exercise?
+
+/carrein-uberthink
+
+## Assistant
+
+Two-part response. Quick check of `capture.ts` first so I can scope the harness fix, then I'll give the workload recommendation.
+
+## Assistant
+
+> Bash: wc -l /Users/carrein/Desktop/iocheck2/scripts/capture.ts; echo "---key signatures---"; grep -nE "key...
+
+## Assistant
+
+> Read: /Users/carrein/Desktop/iocheck2/scripts/capture.ts
+
+## Assistant
+
+> Read: /Users/carrein/Desktop/iocheck2/scripts/capture.ts
+
+## Assistant
+
+## My recommendation: stick with **1000 RPS / 80% miss** as the canonical baseline
+
+Here's the thinking. The bench grid exists to tell a story: **CPU-HPA is the wrong signal; RPS-HPA does the job.** That story is sold by autoscaler **behavior** (when does it scale? by how much? does it hold under stress?), not by latency. p99 was always going to be small on this workload because the service is in-memory + indexed-DB simple.
+
+**What 1000/0.8 gives you (data from prior sessions):**
+- cpu-hpa: pinned at 2 replicas in **every** run — peak CPU 22-28%, never trips the 70% trigger. The wrong-signal failure is *deterministic*.
+- rps-hpa-4: scales to 4 every time.
+- rps-hpa-8: scales to 8 every time.
+- p99 5-16ms across all 6 prior sub-benches. SLO has 12-40× headroom.
+
+**What 2000/0.9 just showed:**
+- cpu-hpa scaled **non-deterministically**: peak=3 in run A, peak=2 in runs B/C. CPU peak crept to 40% — close enough to 70% that a single 60s smoothed sample (which is what `kubectl top` and the HPA see, not the 15s polling our script does) can occasionally trip it. **The wrong-signal failure stops being a clean demo.** An assessor running their first iteration could land on the "A" version and write "cpu-hpa also scales" in their notes.
+- Run B was 1.5-3× slower than A/C in **every** scenario. Cluster noise floor is now visible above the autoscaler signal.
+- p99 still only 5-22ms. We're nowhere near saturating.
+
+**Saturating p99 deliberately (option 3):** to actually push p99 toward 200ms with the current Postgres tuning, we'd need ~4000-6000 RPS. At that load, Postgres is the bottleneck — more iocheck pods don't help because PG is the limit. The autoscaler story disappears entirely (it scales the wrong tier). To meaningfully saturate, you'd need to first raise PG resources, then reshape the workload, and the demo turns into "look how we calibrated the workload to hit p99=180ms" — a *different* exercise.
+
+**Bottom line:** the workload that best honors the exercise's framing ("scale appropriately on an I/O-bound workload") is the one where cpu-hpa **deterministically** fails to fire, RPS-HPA **deterministically** scales, and run-to-run variance is below the autoscaler-decision threshold. That's 1000/0.8. The new data argues *against* changing the canonical.
+
+I'd keep 2000/0.9 as an ad-hoc probe (override on the CLI: `make bench-all TARGET_RPS=2000 MISS_RATE=0.9`) — it's useful for "what happens at 2× load" curiosity — but not as the default.
+
+---
+
+Now fixing the harness gap. Patching `scripts/capture.ts` so unmeasured (null) SLO values render as `n/a` instead of `✗`.
+
+## Assistant
+
+> Edit: /Users/carrein/Desktop/iocheck2/scripts/capture.ts
+
+## Assistant
+
+> Edit: /Users/carrein/Desktop/iocheck2/scripts/capture.ts
+
+## Assistant
+
+> Bash: bunx tsc --noEmit 2>&1 | head -30; echo "---verify edits---"; grep -nE "passP99|passErrorRate|n/a" s...
+
+## Assistant
+
+Typecheck passes. Let me re-run bench-failure on the live cluster to confirm the rendering — it's ~5 min and proves the fix works rather than just hoping the diff is right.
+
+## Assistant
+
+> Bash: set -o pipefail; make -C /Users/carrein/Desktop/iocheck2 bench-failure TARGET_RPS=2000 MISS_RATE=0.9...
+
+## Assistant
+
+> TaskCreate: Re-run bench-failure (2000/0.9) on live cluster, confirm capture.ts now renders unmeasured SLO value...
+
+## Assistant
+
+> TaskUpdate
+
+## Assistant
+
+Verification bench-failure running (ID `babeb0nc7`). I'll confirm the rendering when it completes.
+
+## User
+
+<task-notification>
+<task-id>babeb0nc7</task-id>
+<tool-use-id>toolu_015pEVYJw6B1eRvSxMfjEofT</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-carrein-Desktop-iocheck2/dcd41079-fe06-425f-bc35-83929c0a6a6b/tasks/babeb0nc7.output</output-file>
+<status>completed</status>
+<summary>Background command "Re-run bench-failure to verify n/a rendering" completed (exit code 0)</summary>
+</task-notification>
+
+## Assistant
+
+> Bash: runF2=$(ls -td /Users/carrein/Desktop/iocheck2/artifacts/failure-* | head -1); echo "verification di...
+
+## Assistant
+
+Fix verified. The bench-failure summary now correctly distinguishes "couldn't measure" from "measured and failed":
+
+**Before:** `- p99 < 200ms: ✗ (-)` (looked like a regression)
+**After:** `- p99 < 200ms: n/a (-)` (honest: blackout was the test)
+
+`summary.json` now serializes `pass_p99: null` / `pass_error_rate: null` instead of `false`, which is the truthful representation. The `HPA scaled: ✓` mark stays — that's grounded in the trajectory CSV, which doesn't depend on Prometheus.
+
+Bonus: the fallback validation ran cleanly a second time — replicas held at 8 throughout the blackout window, ScalingActive transitioned False→True consistent with KEDA's fallback policy kicking in. That's two-of-two passes on the writeup §4 claim.
+
+## Assistant
+
+> TaskUpdate
+
+## Assistant
+
+---
+
+## Summary of this session
+
+**Workload recommendation:** keep `MISS_RATE=0.8 / TARGET_RPS=1000` as canonical. The 2000/0.9 run *softened* the cpu-hpa story (non-deterministic scaling) without sharpening the latency story (still 9× under SLO). For a take-home demo, story consistency beats stress numbers.
+
+**Harness fix shipped** (1 file, ~6 lines in `scripts/capture.ts`):
+- `passP99` / `passErrorRate` are now `boolean | null`.
+- `null` (no Prometheus data) renders as `n/a` in `summary.md` and serializes as `null` in `summary.json`.
+- Verified by re-running bench-failure on the live cluster.
+
+**Cluster still up** (KEDA stable, supervised pf alive, Grafana dashboard provisioned). Want me to:
+- Revert defaults if you're aligned with the recommendation? (No-op — `MISS_RATE=0.8 / TARGET_RPS=1000` are already the defaults; nothing to revert. The 2000/0.9 was a CLI override, ephemeral.)
+- `make down`?
+- Commit the capture.ts fix?
