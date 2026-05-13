@@ -10,6 +10,14 @@
 //   PROM_URL        Prometheus base URL (default http://localhost:9090)
 //   POLL_INTERVAL_S sampling cadence (default 5)
 //   KUBECTL         path to kubectl binary (default kubectl)
+//   MODE            human tag for the workload mix — embedded in summary.md
+//                   (default "miss80"; "hot" / "cold" used for extreme runs)
+//   TARGET_RPS      cluster-wide RPS target reported in the summary (default 1000)
+//   MISS_RATE       0..1 fraction of cache-miss requests, reported in the
+//                   summary (default 0.8)
+//   BLACKOUT_AT_S   only for bench-failure: T+seconds when Prometheus is
+//                   scaled to 0. Drives the dedicated fallback-behavior section.
+//   BLACKOUT_DUR_S  only for bench-failure: blackout duration in seconds.
 //
 // Lifecycle:
 //   1. Sample every POLL_INTERVAL_S → append to state.csv
@@ -527,15 +535,17 @@ ${perPodSection}${nodeSection}${failureSection}
   );
   await Bun.write(`${ARTIFACT_DIR}/prometheus-snapshots.json`, JSON.stringify(series, null, 2));
 
-  // Capture HPA describe at end-of-test.
+  // Capture HPA describe at end-of-test. KEDA generates an HPA only when a
+  // ScaledObject is active, so this can legitimately be empty for scenarios
+  // that don't install one — log and continue rather than failing the bench.
   try {
     const proc = Bun.spawn([KUBECTL, "describe", "hpa", "-n", NAMESPACE], {
       stdout: "pipe",
     });
     const text = await new Response(proc.stdout).text();
     await Bun.write(`${ARTIFACT_DIR}/hpa-events.txt`, text);
-  } catch {
-    /* ignore */
+  } catch (err) {
+    console.log(`[capture] hpa describe skipped: ${(err as Error).message}`);
   }
 
   console.log(`\n[capture] wrote ${ARTIFACT_DIR}/summary.md`);

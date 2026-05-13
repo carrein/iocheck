@@ -1,5 +1,7 @@
-# Same as overlays/rps-hpa-8 but with maxReplicaCount=4 — tests whether a
-# very tight horizontal ceiling outperforms 8.
+# Tight-ceiling variant of overlays/rps-hpa-8: maxReplicaCount=4 (vs 8) and
+# fallback.replicas=3 (vs 4) — both scaled to roughly half of the rps-hpa-8
+# headroom. Tests whether a tighter horizontal cap shapes the latency
+# profile differently under the same workload.
 apiVersion: keda.sh/v1alpha1
 kind: ScaledObject
 metadata:
