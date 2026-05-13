@@ -61,7 +61,8 @@ all downloaded or cluster-installed by `make up`.
   `admin.ts`, `shutdown.ts`, `types.ts`)
 - `tests/` — `bun:test` suite (`setup.ts` creates an ephemeral schema)
 - `scripts/` — `bootstrap.sh` (kind/kubectl downloader), `seed.ts` (10k IOCs),
-  `capture.ts` (bench artifact generator), `compare.ts` (bench-all aggregator)
+  `capture.ts` (bench artifact generator), `compare.ts` (bench-all aggregator),
+  `pf.sh` (supervised `kubectl port-forward`; auto-reconnects when the bound pod is replaced)
 - `manifests/` — namespace, postgres, redis, iocheck, monitoring patches,
   Kustomize overlays under `manifests/overlays/{cpu-hpa,rps-hpa-4,rps-hpa-8}/`
 - `loadtest/` — k6 script, ConfigMap, Job
