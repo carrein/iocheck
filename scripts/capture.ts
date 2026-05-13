@@ -293,10 +293,13 @@ async function writeSummary(): Promise<void> {
   }
 
   // SLO booleans. Each is a deterministic pass/fail check against the brief.
-  // Null measurements (no data at all) count as fail — we'd rather flag a
-  // broken capture than silently pass.
-  const passP99 = runP99 !== null && runP99 < 0.2;
-  const passErrorRate = errorRate !== null && errorRate < 0.01;
+  // null = "could not measure" — distinct from false ("measured, didn't
+  // pass"). This matters for bench-failure: during the Prometheus blackout
+  // window the rate() / histogram_quantile() queries return null, and
+  // rendering those as ✗ falsely flags the run as an SLO violation when
+  // the blackout is itself the test. n/a is the honest answer there.
+  const passP99: boolean | null = runP99 === null ? null : runP99 < 0.2;
+  const passErrorRate: boolean | null = errorRate === null ? null : errorRate < 0.01;
   // HPA-responded is informational, not pass/fail — the cpu-hpa scenario is
   // EXPECTED to hold at min (that's Challenge #1's whole point). We render
   // ✓/✗ to show what happened; the brief doesn't say "must scale", only
@@ -416,8 +419,8 @@ Polled every: ${POLL_INTERVAL_S}s
 Workload: TARGET_RPS=${TARGET_RPS}, MISS_RATE=${MISS_RATE} (mode=${MODE})
 
 ## SLO check
-- p99 < 200ms:        ${passP99 ? "✓" : "✗"} (${fmtMs(runP99)})
-- error rate < 1%:    ${passErrorRate ? "✓" : "✗"} (${fmtErrPct(errorRate)} of ${fmtCount(totalReqs)} requests)
+- p99 < 200ms:        ${passP99 === null ? "n/a" : passP99 ? "✓" : "✗"} (${fmtMs(runP99)})
+- error rate < 1%:    ${passErrorRate === null ? "n/a" : passErrorRate ? "✓" : "✗"} (${fmtErrPct(errorRate)} of ${fmtCount(totalReqs)} requests)
 - HPA scaled:         ${scaled ? "✓" : "✗"} (replicas ${minReplicas === 999 ? "?" : minReplicas} → ${peakReplicas} → ${finalReplicas})
 
 ## Key numbers
