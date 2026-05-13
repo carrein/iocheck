@@ -53,7 +53,7 @@ As per instructions listed in [EXERCISE.md](./EXERCISE.md), the chat logs used t
 
 # Demo
 
-All four bench targets share the same workload (80% miss / 20% hot @ 1000 RPS). Autoscaling shape is the only variable. For a hermetic run, the cluster should be reset between scenarios so results are directly comparable.
+All bench targets share the same workload (80% miss / 20% hot @ 1000 RPS). Autoscaling shape is the only variable. For a hermetic run, the cluster should be reset between scenarios so results are directly comparable.
 
 | Bench           | Description                                                                                                                   |
 | --------------- | ----------------------------------------------------------------------------------------------------------------------------- |
