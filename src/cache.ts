@@ -3,7 +3,7 @@ import type { IOC, IOCType } from "./types";
 
 const url = process.env.REDIS_URL ?? "redis://localhost:56379";
 
-export const cache = new RedisClient(url, {
+const cache = new RedisClient(url, {
   connectionTimeout: 5000,
   autoReconnect: true,
   maxRetries: 10,
@@ -23,7 +23,7 @@ export type Cached = IOC | "unknown" | null;
 
 export async function getCached(type: IOCType, value: string): Promise<Cached> {
   const raw = await cache.get(key(type, value));
-  if (raw === null || raw === undefined) return null;
+  if (raw === null) return null;
   if (raw === MISS_SENTINEL) return "unknown";
   try {
     return JSON.parse(raw) as IOC;

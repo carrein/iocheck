@@ -36,6 +36,17 @@ export const dbQueriesTotal = new client.Counter({
   registers: [registry],
 });
 
+// Per-step latency for the /lookup hot path so we can attribute p99 to
+// Redis GET, Postgres SELECT, or Redis SET-on-miss. Buckets sized sub-ms
+// to ~1s; typical case is 1–5ms per hop.
+export const lookupStepDuration = new client.Histogram({
+  name: "lookup_step_duration_seconds",
+  help: "Per-step latency inside /lookup (cache_get, pg_find, cache_set)",
+  labelNames: ["step"] as const,
+  buckets: [0.0005, 0.001, 0.002, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1],
+  registers: [registry],
+});
+
 export const inflightRequests = new client.Gauge({
   name: "iocheck_inflight_requests",
   help: "In-flight HTTP requests sampled from Bun.serve.pendingRequests",
