@@ -1,12 +1,57 @@
-# iocheck — Writeup
+# iocheck Writeup
 
 A backend service for SOC analysts to check whether an IOC (IP / domain / sha256)
-is known-malicious. Built per [`EXERCISE.md`](./EXERCISE.md); the four
-challenges and the failure-mode + future-work prompts are answered below.
+is known-malicious.
 
----
+All measured numbers in this document are from runs on a local 4-node `kind` cluster (1 control-plane + 3 workers) on a single macOS host.
 
-## 1. Architecture
+This exercise was completed with the assistance of Claude (Opus 4.7).
+
+Claude's assistance took the following forms:
+
+- Parsing the problem statement: working through the brief, decoding requirements, and surfacing assumptions worth clarifying.
+- Teaching mode: Q&A and ELI5 explanations to build intuition for concepts like KEDA, Prometheus, and Little's Law.
+- Researching prior art: looking for precedents (Knative concurrency, Zalando's autoscaler) and suggesting sane defaults.
+- Scaffolding the implementation: drafting code, manifests, and configuration via Claude Code.
+
+In general, the AI is used to close knowledge gaps and iterate fast while I still maintain decision agency.
+
+# Assumptions
+
+The brief leaves several open decisions. In general, when faced with ambiguity, I picked the options that have strong _prior precedence_ i.e. recommended defaults by the tooling docs or real-world constraints i.e. my local environment. The following are non-exhaustive:
+
+| Assumption | Detail |
+|---|---|
+| Verdict semantics | Row in `iocs` ⇒ `"malicious"`, absence ⇒ `"unknown"`. `score` is metadata, not a threshold. |
+| IOC lifetime | Immortal. Cache TTL (5 min hit / 60 s miss) is a freshness-vs-cost knob, not a staleness SLA. |
+| Cache ephemerality | Redis `--save "" --appendonly no`, `allkeys-lru` at 256 MB. Restart = cold cache; LRU can preempt TTL. |
+| Write pattern | Low-rate via `POST /ioc`. No batch ingestion. |
+| Auth posture | `POST /ioc` needs `X-Admin-Token`; `/lookup` open. Service is NodePort (kind host `:8080`); no Ingress, no mTLS. |
+| Sizing target | Interpreting the brief's qualitative "alert storms = ~10× RPS spikes" as ~1000 RPS sustained with ~10× burst on laptop kind. Tests autoscaler _behavior_, not raw throughput. |
+| Burst shape | Benches default `MISS_RATE=0.8` (80% miss stress mix). Motivates the in-flight pivot in the future-work section. |
+| Pool calibration | `PG_POOL_MAX=10/pod` × 8 = 80 conns vs Postgres `max_connections=200`. Headroom keeps scale-out from saturating the DB. |
+| Autoscaler data source | Prometheus is chosen, not prescribed by the brief. The fallback story depends on this pick: a metrics-server or custom-adapter path would fail differently. |
+| Load origin | Benches drive k6 as an in-cluster Job hitting ClusterIP. External clients via NodePort or Ingress would see different TCP-stickiness behavior; calibrations are in-cluster numbers. |
+
+# Goals
+
+| # | Goal | Type |
+|---|---|---|
+| 1 | Demonstrate why CPU-based HPA is the wrong signal for this workload, with measurements | Deliverable |
+| 2 | Show load is spread evenly across replicas: no client stickiness, no hotspots | Deliverable |
+| 3 | Scale up and down on real demand: first event seconds into a burst, return to floor minutes after it ends | Deliverable |
+| 4 | Reproducible from a clean machine: `make up && make bench-*` with no manual steps | Deliverable |
+| 5 | p99 < 200 ms under sustained load, post-scale-up stabilization (see SLO interpretation below) | Constraint |
+| 6 | PDB `minAvailable: 2` holds through voluntary disruption | Constraint |
+| 7 | Document and measure behavior when the autoscaler's data source is unavailable | Deliverable |
+| - | Raw throughput records | Out of scope |
+| - | Production-grade HA on dependencies (single-replica Postgres + Redis) | Out of scope |
+| - | Ingress / auth hardening | Out of scope |
+| - | Batch ingestion | Out of scope |
+
+Out-of-scope items are flagged in the future-work section.
+
+# Architecture
 
 ```mermaid
 flowchart LR
@@ -37,73 +82,107 @@ flowchart LR
     hpa -->|scales| svc
 ```
 
-- **Language / framework**: TypeScript on **Bun 1.3**, using `Bun.serve` directly
-  (no router framework). Bun was specified by the brief's "TypeScript" line and
-  the user's "lean on Bun's std lib" guidance — TS, HTTP, SQL, Redis, and a test
-  runner all ship in one toolchain, making the dev/CI/image story tighter.
-- **Persistent store**: **Postgres 17** (Alpine, StatefulSet, one replica, 2 GiB
-  PVC). Composite primary key `(type, value)` matches the exercise's
-  lookup pattern exactly; `ON CONFLICT … DO UPDATE` gives a one-statement upsert.
-  Considered Redis-only and DynamoDB-style KV: relational won because lookups
-  are keyed on a tuple and the schema check constraints (`score 0–100`,
-  `type IN ('ip','domain','sha256')`) carry their weight.
-- **Cache**: **Redis 7.4**, single Deployment, `--maxmemory 256mb
-  --maxmemory-policy allkeys-lru --save ""`. Read-through; on cache miss the
-  service consults Postgres and back-fills. On `POST /ioc` we `DEL` the key —
-  invalidation, not write-through, because the cache also holds short-lived
-  *negative* tombstones (unknown values cached for 60 s, hot positives 5 min),
-  and these need to be flushed too. Ephemeral by design: the cache is
-  reconstructible from Postgres on cold start.
-- **Cluster**: **kind 0.31** with 1 control-plane + 3 worker nodes,
-  `kindest/node:v1.32.0`. Multi-node is load-bearing: pod anti-affinity spreads
-  iocheck replicas across workers, so kube-proxy round-robins ClusterIP traffic
-  across nodes (Challenge #2). Single-node kind hides the cross-node split and
-  makes "pods share load" trivially true.
-- **Autoscaling signal**: cluster-total RPS via Prometheus, divided by replica
-  count inside HPA (KEDA `metricType: AverageValue`), target **100 RPS/pod**.
-  Rationale below.
+| Component | Pick | Why |
+|---|---|---|
+| Service runtime | Bun (`Bun.serve` directly, no router) | Fast TS-native runtime that bundles HTTP, SQL, Redis client, and a test runner. |
+| Persistent store | Postgres | Composite-key relational lookup with schema-side CHECK constraints; beat Redis-only / KV on key shape and validation. |
+| Cache | Redis | Read-through with negative tombstones; PG is the source of truth, cache reconstructible on cold start. |
+| Cluster | kind | Multi-node enables pod anti-affinity → real load distribution across workers (Challenge #2). |
+| Metrics TSDB | Prometheus (via kube-prometheus) | Industry-default TSDB and KEDA's most-supported scaler input. |
+| Dashboards | Grafana | Bundled with kube-prometheus; anonymous Admin for demo only. |
+| Autoscaler | KEDA (drives a generated HPA) | Plugs Prometheus into a managed HPA: non-CPU triggers + fallback behavior. |
+| Load generator | k6 | Open-model `ramping-arrival-rate` executor: RPS is a fixed input, not gated by service throughput. |
+
+### Why RPS as the scaling signal
+
+You have to start from a defensible default; AI research surfaced two precedents:
+
+- **In-flight / concurrency**: [Knative KPA](https://knative.dev/docs/serving/autoscaling/). Fits uniform per-request cost (serverless).
+- **RPS**: [Zalando's `kube-metrics-adapter`](https://github.com/zalando-incubator/kube-metrics-adapter). Built for cache-fronted HTTP at scale.
+
+iocheck is Zalando's shape (stateless, cache-fronted), and RPS is operationally legible: every dashboard and load-test tool speaks it. **RPS becomes the default benchmark**: CPU is the wrong-answer comparison, in-flight is the next-step extension. Target **100 RPS/pod**.
+
+CPU is dismissed structurally: per-request CPU on a cache-fronted Bun service is dominated by JSON parse + Redis I/O wait, not arrival rate. Confirmed empirically under load.
 
 ### SLO interpretation
-`p99 < 200 ms` is read as **post-stabilization steady state**, not strict
-throughout the test. Scale-up takes ~60–90 s; during that window the in-flight
-queue drains and p99 spikes briefly. We measure success as p99 *holding* under
-200 ms once the HPA settles, plus zero error rate. In practice on this
-calibration, both scenarios held p99 < 20 ms — the bottleneck during my
-measurements was the autoscaler signal, not the service.
+
+`p99 < 200 ms` is read as post-stabilization steady state, not strict throughout. Scale-up takes ~60–90 s and p99 spikes briefly while the in-flight queue drains; the SLO holds once the HPA settles, plus zero error rate. Measured runs landed p99 < 20 ms: the bottleneck was the autoscaler signal, not the service.
 
 ---
 
 ## 2. API (as built)
 
-All shapes match `EXERCISE.md`. Verdict rule: a row in `iocs` ⇒ `"malicious"`;
-absence ⇒ `"unknown"`. `score` is metadata, not a threshold — the brief leaves
-the rule undefined so the simplest interpretation is the right one.
+All shapes match `EXERCISE.md`. Verdict rule: a row in `iocs` ⇒ `"malicious"`, absence ⇒ `"unknown"`. `score` is metadata, not a threshold: the brief leaves the rule undefined, so the simplest interpretation wins.
 
-- `POST /lookup` `{type, value}` → `{verdict, ioc?}`. Validates `type ∈
-  {ip,domain,sha256}`, non-empty `value`. Read-through cache.
-- `POST /ioc` `{type, value, source, score}` → 201. Requires
-  `X-Admin-Token` header; rejects with 401 on mismatch. Validates `score`
-  is a number in `[0, 100]`. Cache `DEL` after the DB upsert returns.
-- `GET /healthz` — always 200 while the process is running. Used for k8s
-  liveness; never reaches DB/cache.
-- `GET /readyz` — 200 only when **both** Postgres and Redis answer. Result is
-  cached for 1 s so probe traffic doesn't hammer dependencies. Returns 503
-  during a SIGTERM drain so kube-proxy de-registers the pod before in-flight
-  requests are interrupted. Also wired as the startup probe (1 s period, 30
-  failure threshold) so cold pods get a 30 s grace window before liveness
-  starts counting failures.
-- `GET /metrics` — Prometheus exposition. Custom series:
-  `http_requests_total`, `http_request_duration_seconds`, `cache_lookups_total`
-  (labels: `hit|miss|unknown`), `db_queries_total`, `iocheck_inflight_requests`
-  (sampled from Bun's `server.pendingRequests` once per second).
-  `prom-client`'s `collectDefaultMetrics()` is *not* called — it crashes Bun
-  via `perf_hooks.monitorEventLoopDelay` (oven-sh/bun#18300).
+| Route | Method | Auth | Behavior |
+|---|---|---|---|
+| `/lookup` | POST | - | `{type, value}` → `{verdict, ioc?}`. Validates `type ∈ {ip, domain, sha256}` + non-empty `value`. Read-through cache. |
+| `/ioc` | POST | `X-Admin-Token` (401 on mismatch) | `{type, value, source, score}` → 201. Validates `score ∈ [0, 100]`. Cache `DEL` after upsert returns. |
+| `/healthz` | GET | - | Always 200 while the process is running. Liveness probe; never reaches DB/cache. |
+| `/readyz` | GET | - | 200 only when both Postgres and Redis answer; result cached 1 s. Returns 503 during SIGTERM drain so kube-proxy de-registers before in-flight is interrupted. Also wired as the startup probe (30 s cold-pod grace). |
+| `/metrics` | GET | - | Prometheus exposition. Custom series: `http_requests_total`, `http_request_duration_seconds`, `cache_lookups_total{result}`, `db_queries_total`, `iocheck_inflight_requests`. `prom-client`'s `collectDefaultMetrics()` is _not_ called, crashes Bun via `perf_hooks.monitorEventLoopDelay` (oven-sh/bun#18300). |
 
 ---
 
-## 3. The four challenges
+## 3. Resources & budgets
 
-### Challenge 1 — Why CPU-based HPA is wrong
+| Component | Replicas | CPU req → limit | Mem req → limit | Why |
+|---|---|---|---|---|
+| iocheck | 2 → 8 (KEDA) | 300m → 1000m | 128Mi → 256Mi | Sized so per-pod CPU sits well below the 70% CPU-HPA trigger at 1k RPS: the wrong-signal demonstration. |
+| postgres | 1 | 1000m → none | 512Mi → 1Gi | At 200m, PG starved on `cpu.shares` against 8 × 300m iocheck demand; 1000m restores scheduling priority. |
+| redis | 1 | 500m → 2000m | 64Mi → 384Mi | Single-threaded: at 50m, slowlog entries hit 10–60 ms under contention. 500m floor + 2000m ceiling smooths tail latency. |
+| k6 Job | 4 parallel pods | 500m → none | 256Mi → 1Gi | Four parallel pods deliver `TARGET_RPS` past macOS-loopback ephemeral-port caps. |
+| prometheus | 1 | kube-prometheus defaults | kube-prometheus defaults | Default install minus `alertmanager-*` and `blackboxExporter-*` (RAM budget). |
+| grafana | 1 | kube-prometheus defaults | kube-prometheus defaults | Default install; anonymous Admin for demo only. |
+| KEDA operator | 1 | KEDA-chart defaults | KEDA-chart defaults | Default chart install; version pinned for fallback `behavior: currentReplicasIfHigher`. |
+
+Cluster budget: 4-node kind (1 control-plane + 3 workers, all Docker containers on the same macOS host). Peak sustained demand under `bench-rps8` is roughly `8 × 300m (iocheck) + 1000m (PG) + 500m (Redis) + 4 × 500m (k6) ≈ 5.9 CPU` plus monitoring overhead, which fits a 12–16 CPU Docker Desktop budget. Below that, scheduler starvation surfaces (which is how we found the Postgres and Redis floors).
+
+Postgres also reserves a 2 Gi local-path PVC for `/var/lib/postgresql/data`. Redis runs without persistence (`--save "" --appendonly no`).
+
+---
+
+## 4. Load testing suites
+
+Five `make bench-*` targets, all sharing the same workload knobs (`TARGET_RPS=1000`, `MISS_RATE=0.8`) for direct comparability.
+
+| Target | Overlay | Asks |
+|---|---|---|
+| `make bench-cpu` | `cpu-hpa` | Does CPU-HPA scale this workload? |
+| `make bench-rps4` | `rps-hpa-4` | RPS-HPA with tight ceiling (max=4) |
+| `make bench-rps8` | `rps-hpa-8` | RPS-HPA with moderate ceiling (max=8); also exercises load distribution across 8 pods |
+| `make bench-failure` | `rps-hpa-8` | KEDA fallback when Prometheus is unreachable. Patches `prometheus-k8s` to `replicas=0` at T+75 s for 90 s, then restores. |
+| `make bench-all` | three above | Sequential cpu + rps4 + rps8, emits a `comparison.md` side-by-side |
+
+**Load curve (shared by all):**
+
+| Phase | Duration | What |
+|---|---|---|
+| Ramp | 30 s | 0 → `TARGET_RPS` |
+| Sustain | 90 s | `TARGET_RPS` held |
+| Drain | 30 s | `TARGET_RPS` → 0 |
+| Observe | 120 s | k6 done; bench script polls for scale-down |
+| **Total** | **~4.5 min** | per bench |
+
+**Why those phase widths.** The 30 s ramp avoids step-function artifacts while still pushing the slowest scaler (CPU-HPA, ~80 s to first scale event because of the 1-min Prometheus query window + 15 s polling + HPA sync) into the sustain window. The 90 s sustain covers that worst-case reaction time and still leaves a clean steady-state p99 reading for the fast paths. The 30 s drain pushes per-pod RPS below the KEDA threshold quickly so the post-bench window can witness scale-down. The 120 s observe covers KEDA `cooldownPeriod: 60s` plus HPA `scaleDown.stabilizationWindowSeconds: 60s`, enough for replicas to return to min before the bench cuts off.
+
+**Why `ramping-arrival-rate` (open model).** Offered RPS is a fixed *input* regardless of how fast the service responds. The alternative (closed-model VUs, where each worker waits for its previous request to finish before sending the next) lets slow responses throttle the load, hiding the latency degradation we're trying to measure.
+
+**Why `MISS_RATE=0.8` default.** Stress mix (80% miss, 20% hot): exercises both cache and DB and pinches the PG pool harder than a cache-friendly profile would. Tunable per run: `MISS_RATE=0.1` for hot-friendly, `MISS_RATE=1.0` for an all-miss DB-saturation probe.
+
+**Why `parallelism: 4`.** A single k6 pod with `noConnectionReuse` caps at ~250 RPS on macOS-loopback (ephemeral-port exhaustion). Four pods together deliver `TARGET_RPS` and arrive from four distinct ClusterIP source IPs, exercising kube-proxy hashing.
+
+**Why `noConnectionReuse: true`.** Kubernetes' default routing picks a backend pod when a TCP connection opens, not when each request is sent. If k6 kept connections alive, every worker would pin to whichever pod it first hit, and newly-scaled replicas would see zero traffic. Cycling connections forces a fresh routing decision per request, mirroring what an L7 load balancer or service mesh does in production.
+
+---
+
+## 5. The four challenges
+
+![Grafana dashboard during a bench run](./grafana.png)
+
+The six panels above visualise everything the challenges discuss: replica trajectory, per-pod RPS against the KEDA target (100), p99 latency against the 200 ms SLO, CPU% against the 70% HPA trigger (which never fires), in-flight requests per pod, and cache hit rate.
+
+### Challenge 1: Why CPU-based HPA is wrong
 
 **Setup.** Pods sized at `requests.cpu: 300m, limits.cpu: 1000m`. CPU HPA at 70%
 of request → trigger line at **210 mCPU per pod**. Load: ramp 0→100 RPS over
@@ -112,6 +191,7 @@ matches the brief. 90% hot keys (cache hits), 10% cold (miss → DB). Min=2,
 max=8 replicas.
 
 **Observation** (from `artifacts/cpu-hpa-20260512T145133Z/summary.md`):
+
 - Peak RPS (cluster): **956 RPS** (≈478 RPS/pod at min=2 replicas)
 - Peak per-pod CPU during burst: **20.2% of request** (~60 mCPU avg)
 - Avg per-pod CPU: **14.2%**
@@ -123,65 +203,67 @@ The takeaway is sharper than the "p99 walls because CPU is fooled" version of
 this story. For our isolated workload on a laptop, **CPU never moves above
 ~20% of request** even at 956 RPS. The threshold (70%) sits a factor of 3.5
 above peak observed CPU. **CPU HPA would not scale this service under any
-plausible 10× burst** — replicas would stay at min regardless of the
+plausible 10× burst**: replicas would stay at min regardless of the
 workload's actual demand on the system.
 
 **Root cause.** The workload is cache-friendly read traffic. With ~90% Redis
 hit rate, the average request spends nearly all its wall time waiting on
-Redis I/O — a few hundred microseconds of CPU, then idle. CPU is dominated by
-JSON parse/serialise plus a Redis GET; at 478 RPS/pod the measured per-pod CPU
-sits at ~60 mCPU (20% of the 300m request). On a heavier workload — colder
-cache, slower downstream — the bottleneck would be **event-loop concurrency**:
-Bun is single-threaded for handlers, so when in-flight grows past the loop's
-comfortable working set, requests queue, p99 climbs — and **none of that
+Redis I/O: a few hundred microseconds of CPU, then idle. CPU work is mostly
+JSON parse + a Redis GET; at 478 RPS/pod the measured per-pod CPU sits at
+~60 mCPU (20% of the 300m request). On a heavier workload (colder cache,
+slower downstream), the real bottleneck would be **concurrency**, not raw
+compute: Bun handles requests on a single thread, so once too many requests
+are in flight at once they pile up in a queue, p99 climbs, and **none of that
 shows up in CPU**.
 
 **The mechanical math.** Measured CPU per request: ~0.12 ms on a hit. At 478
 RPS/pod with ~94/6 split, expected CPU = 478 × 0.12 ms/s ≈ 57 mCPU/pod. That
 matches the 60 mCPU measurement closely and lands at **19% of the 300m
-request** — a factor of 3.5 below the 70% HPA threshold. Shrinking the
+request**, a factor of 3.5 below the 70% HPA threshold. Shrinking the
 request to make CPU fire would itself be a misconfiguration: it makes the pod
 look smaller than it is for scheduling, harming bin-packing and inviting OOM
 kills under spike memory pressure.
 
 **Conclusion.** The signal that correlates with user-visible degradation here
 is **in-flight requests or RPS**, not CPU. CPU answers "is the box working
-hard?" — the right question for a tail-latency SLO is "are we keeping up with
+hard?", but the right question for a tail-latency SLO is "are we keeping up with
 arrival rate?" RPS is defensible for this workload because the mix is
 well-characterised; the principled long-term signal is a saturation metric
-(in-flight per pod) — see §5.
+(in-flight per pod).
 
-### Challenge 2 — Pods sharing load
+### Challenge 2: Pods sharing load
 
-**Mechanism.** Service is ClusterIP `internalTrafficPolicy: Cluster` (default).
-kube-proxy in iptables mode round-robins TCP connections across endpoints. The
-k6 Job runs **inside the cluster** with `ramping-arrival-rate` (open model) —
-many concurrent VUs (`preAllocatedVUs: 200`), short-lived requests, distinct
-sockets. New TCP connection per request → genuine per-request load-balance.
+**Mechanism.** Kubernetes' default in-cluster router (kube-proxy) picks a
+backend pod every time a new TCP connection opens, then sends the whole
+connection there. The k6 load generator runs inside the cluster and opens a
+fresh TCP connection per request, so each request gets re-routed across the
+pod pool and load spreads evenly.
 
 **Evidence.** From `kubectl logs -l app=iocheck`, request counts per pod at
 end-of-burst land within ±8% of the average (range 100–110 RPS when the mean
-is 100). Pod anti-affinity (`preferredDuringScheduling`) pushes replicas onto
-distinct workers, so the per-node load is also balanced.
+is 100). Pod anti-affinity also pushes replicas onto distinct worker nodes, so
+per-node load stays balanced too.
 
-**Connection-stickiness gotcha.** kube-proxy iptables mode balances *at
-TCP-connect time*, so HTTP/1.1 keep-alive pins all requests to one pod. The
-k6 open-model with many short-lived VUs sidesteps this; in production the
-equivalent is an L7 LB or service mesh that rebalances per request.
+**Connection-stickiness gotcha.** If you reuse TCP connections (HTTP/1.1
+keep-alive, the default in most clients), every request on that connection
+sticks to the pod it first hit. Replicas KEDA spins up mid-bench would see
+zero traffic. We disable keep-alive in k6 to sidestep this; in production the
+right fix is an L7 load balancer or service mesh that re-routes per request.
 
-### Challenge 3 — Autoscaler that scales up and down
+### Challenge 3: Autoscaler that scales up and down
 
-- **Signal**: cluster RPS via Prometheus —
+- **Signal**: cluster RPS via Prometheus, queried as
   `sum(rate(http_requests_total{service="iocheck"}[1m]))`.
 - **Target**: 100 RPS per pod (`metricType: AverageValue`, threshold `"100"`).
-  HPA divides the cluster value by replica count internally — KEDA's
-  most-common footgun (kedacore/keda#3035) is pre-dividing in PromQL, which
-  causes double-division.
+  The PromQL query returns the *cluster-wide* RPS; the HPA divides that by the
+  current replica count to get the per-pod number. A common mistake is dividing
+  again inside the query (kedacore/keda#3035), which makes the autoscaler
+  under-react by a factor of N.
 - **Why 100?** Per-pod sustainable throughput on this workload is ~200 RPS
   cache-heavy on the configured pod size before in-flight queueing kicks in.
   Target = half of saturation gives ~2× headroom on the way up before queueing
-  starts hurting p99. First pick was 50 (very conservative) — bench produced
-  replicas pinned to ceiling even at modest load. Settled at 100 to keep the
+  starts hurting p99. First pick was 50 (very conservative), but the bench
+  pinned replicas to ceiling even at modest load. Settled at 100 to keep the
   demo trajectory visible (2 → ceiling only under genuine burst).
 - **min replicas: 2.** Required by the brief's PDB `minAvailable ≥ 2`. Also a
   pragmatic floor: a single replica cold-cache after a node failure produces a
@@ -193,7 +275,7 @@ equivalent is an L7 LB or service mesh that rebalances per request.
   shapes the latency profile against the same workload; for production the
   cap should be set with downstream resource awareness (DB pool, cache shards).
 - **Scale-up**: `stabilizationWindowSeconds: 0`, "+100% or +4 pods per 15 s,
-  take larger." Aggressive on purpose — alert storms ramp fast.
+  take larger." Aggressive on purpose, alert storms ramp fast.
 - **Scale-down**: `stabilizationWindowSeconds: 60`, "25% per 60 s." Reduces
   thrash on momentary dips; the k8s default of 300 s is too patient for a
   5-min demo cycle. With this config, replicas begin dropping ~60 s after
@@ -201,120 +283,74 @@ equivalent is an L7 LB or service mesh that rebalances per request.
 
 Manifests: `manifests/overlays/{cpu-hpa,rps-hpa-4,rps-hpa-8}/scaledobject.yaml`.
 
-### Challenge 4 — Reproducible proof
+### Challenge 4: Reproducible proof
 
-- **Tool**: k6 (`grafana/k6:1.3.0`) in `loadtest/script.js`, `ramping-arrival-rate`
+- **Tool**: k6 in `loadtest/script.js`, `ramping-arrival-rate`
   executor. Open-model so request rate is a fixed input, not a function of how
   fast the service can serve.
 - **Reproduction**:
-  1. `make up` — clean cluster, deployed stack, seeded 10k IOCs.
-  2. `make bench-cpu` — applies CPU overlay, runs the 30s/90s/30s load
+  1. `make up`: clean cluster, deployed stack, seeded 10k IOCs.
+  2. `make bench-cpu`: applies CPU overlay, runs the 30s/90s/30s load
      profile + 120s observation window, captures artifacts to
      `artifacts/cpu-hpa-<mode>-<ts>/`.
-  3. `make bench-rps4` / `make bench-rps8` — RPS-HPA overlays at the two
+  3. `make bench-rps4` / `make bench-rps8`: RPS-HPA overlays at the two
      ceilings, same profile, artifacts to `artifacts/rps-hpa-{4,8}-<mode>-<ts>/`.
-  4. `make bench-failure` — same rps-hpa-8 overlay with a Prometheus
-     blackout at T+75s; see §4 below.
-  All three autoscaling targets share the same default workload
-  (`TARGET_RPS=1000`, `MISS_RATE=0.8`) so results are directly comparable.
+  4. `make bench-failure`: same rps-hpa-8 overlay with a Prometheus
+     blackout at T+75s.
+     All three autoscaling targets share the same default workload
+     (`TARGET_RPS=1000`, `MISS_RATE=0.8`) so results are directly comparable.
 - **Reference numbers** (from `artifacts/bench-all-20260513T131227Z/`):
 
-  | Metric                        | cpu-hpa     | rps-hpa-4    | rps-hpa-8    |
-  |-------------------------------|-------------|--------------|--------------|
-  | Peak RPS (cluster)            | 1000.5      | 1001.1       | 962.6        |
-  | p99 latency                   | 6 ms        | 5 ms         | 6 ms         |
-  | Replicas (min → peak → final) | 2 → 2 → 2   | 2 → 4 → 3    | 2 → 8 → 6    |
-  | Peak CPU % of request         | 27.7%       | 21.2%        | 29.2%        |
-  | Total requests / errors       | 123,864 / 0 | 120,391 / 0  | 117,458 / 0  |
-  | Cache hit rate                | 20.0%       | 19.9%        | 19.7%        |
+  | Metric                        | cpu-hpa     | rps-hpa-4   | rps-hpa-8   |
+  | ----------------------------- | ----------- | ----------- | ----------- |
+  | Peak RPS (cluster)            | 1000.5      | 1001.1      | 962.6       |
+  | p99 latency                   | 6 ms        | 5 ms        | 6 ms        |
+  | Replicas (min → peak → final) | 2 → 2 → 2   | 2 → 4 → 3   | 2 → 8 → 6   |
+  | Peak CPU % of request         | 27.7%       | 21.2%       | 29.2%       |
+  | Total requests / errors       | 123,864 / 0 | 120,391 / 0 | 117,458 / 0 |
+  | Cache hit rate                | 20.0%       | 19.9%       | 19.7%       |
 
   RPS-HPA scenarios scale 2 → ceiling on burst; CPU-HPA holds at 2 because
   per-pod CPU never crosses the 70% trigger. All three hold p99 well under
   the 200 ms SLO with zero errors.
+
 - **Artifacts**: each bench drops `summary.md` (rendered table), `k6-stdout.txt`,
   `replica-trajectory.csv` (5-s samples), `prometheus-snapshots.json` (range
   queries for RPS / p99 / CPU% / replicas / in-flight), `hpa-events.txt`.
 
 ---
 
-## 4. Failure mode — autoscaler data source unavailable
+## 6. Failure mode: autoscaler data source unavailable
 
-**Scenario**: Prometheus goes down mid-burst. KEDA polls Prometheus every 15 s;
-after `fallback.failureThreshold: 3` consecutive failures (~45 s), it pins the
-HPA target to `fallback.replicas: 4` with `behavior: static`.
+If Prometheus disappears, the HPA loses its metric input and freezes at the current replica count by default. The data plane (iocheck, Postgres, Redis) keeps serving. Only the autoscaler goes blind.
 
-**HPA behavior without fallback**: the HPA would report `ScalingActive=False`
-with reason `FailedGetExternalMetric` and **freeze** at current replicas —
-either over- or under-provisioned indefinitely.
+KEDA's `fallback` block covers this. We configure:
 
-**Service impact during the outage**: zero. The data plane (iocheck pods,
-Postgres, Redis) is independent of Prometheus. Only the control plane (HPA)
-is affected.
+- `fallback.replicas: 4`: a mid-load floor that neither starves at min nor overshoots to max.
+- `behavior: currentReplicasIfHigher`: if replica count is already above the floor (mid-burst), hold; otherwise lift to 4. `static` would pull us back to 4 even from 8, the worst time to lose pods.
 
-**Mitigation in place**:
-- KEDA `fallback.replicas: 4` — mid-load floor. Neither starves at min nor
-  thunders to max. Configured in `manifests/overlays/rps-hpa-8/scaledobject.yaml`
-  (and the equivalent `replicas: 3` in `rps-hpa-4/`).
-- `behavior: currentReplicasIfHigher` — holds the current replica count if
-  it's already above the fallback floor, otherwise lifts to 4. Beats `static`,
-  which would *down-scale* us to 4 even if we were already at 8 mid-burst —
-  the worst possible moment to lose pods. Matches KEDA's and Kedify's
-  production recommendation. Requires KEDA ≥ 2.17.
-- The PDB (`minAvailable: 2`) ensures the fallback never violates the floor.
+PDB `minAvailable: 2` guarantees the fallback never violates the floor.
 
-**Reproduction**: now reproducible via `make bench-failure` — applies the
-rps-hpa-8 overlay, patches `prometheus k8s` to `replicas=0` at T+75s for
-90s, then restores. The capture script tracks the KEDA-HPA's
-`ScalingActive` condition across the window and renders a dedicated
-"Fallback behavior" section in `summary.md` showing the replica
-trajectory across the blackout.
-
-**With more time**: a secondary CPU-based HPA as a *floor* (compound HPA
-pattern) so sustained load still scales when Prometheus is gone, plus alerts
-on `up{job="prometheus"} == 0` and KEDA controller error events.
+**Measured.** `make bench-failure` runs the standard load profile, then patches `prometheus k8s` to `replicas=0` at T+75s for 90s before restoring. The capture script tracks KEDA's `ScalingActive` condition across the blackout and renders a "Fallback behavior" section in `summary.md` showing the replica trajectory.
 
 ---
 
-## 5. With another week
+## 7. With another week
 
-**Replace RPS with in-flight requests per pod as the primary signal.** RPS works
-here because the workload mix is well-characterised — high cache-hit rate, hot
-keys dominate under burst, per-pod saturation ≈ 200 RPS. In any of those
-conditions changing (cold start, all-miss attack, downstream slowness), RPS
-becomes a misleading proxy. In-flight is causally closer to "is queueing
-hurting users?" and would survive workload drift without re-tuning.
+The bench grid evaluates one scaling signal against one alternative. The interesting work lives in the space we didn't bench.
 
-The implementation is small — the gauge is already exposed
-(`iocheck_inflight_requests`); only the `ScaledObject` query and threshold
-change:
-```yaml
-query: sum(iocheck_inflight_requests{service="iocheck"})
-threshold: "20"   # 20 in-flight per pod
-metricType: AverageValue
-```
+1. **Explore scaling signals.** Add in-flight per pod and composite triggers (p99 OR RPS) as overlays alongside RPS-HPA. Extend `make bench-all` so one run produces side-by-side artifacts across the matrix: the deliverable becomes *which signal best holds p99 under which workload shape*, not "is signal X good."
 
-The next iteration would author a `manifests/overlays/inflight-hpa/` overlay
-carrying the trigger above, add a `bench-inflight` Makefile target, and rerun
-the same load profile so RPS-HPA and inflight-HPA land in side-by-side
-artifacts. The validation — not the overlay itself — is the work.
+2. **Chaos tests.** Kill iocheck pods mid-burst, partition Redis, inject `pg_sleep` into queries. Validates that the failure modes documented in code comments are the failure modes that actually happen. Natural extension of `bench-failure`, which only kills Prometheus.
+
+3. **pgbouncer in front of Postgres.** Decouples iocheck pod count from DB connection count. Removes the PG pool calibration as a hard ceiling on `maxReplicaCount` and unblocks higher-replica regimes.
+
+4. **Operator dashboard.** Distinct from engineering Grafana: SOC-shift panels, lookups by source, top queried IOCs, score-distribution drift, false-positive flagging path. Turns the demo from "watch the autoscaler curve" into "what an analyst would actually use."
+
+5. **IOC lifecycle.** `added_at` is informational and rows are immortal (flagged in Assumptions). Production wants per-source TTL, decay scoring, manual expiry, and an audit trail: the biggest gap between "what we built" and "what an SOC would deploy."
 
 ---
 
-## Appendix — citations
+## 8. Lessons learned
 
-- KEDA Prometheus scaler — averaging gotcha:
-  <https://github.com/kedacore/keda/discussions/3035> (PromQL must return
-  cluster-total when `metricType: AverageValue`; HPA divides internally).
-- Bun + prom-client compat: <https://github.com/oven-sh/bun/issues/18300>
-  (default metrics collector crashes on `monitorEventLoopDelay`).
-- HPA scale-up/scale-down behavior:
-  <https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/#configurable-scaling-behavior>
-  (the `behavior` block we use to override the conservative defaults).
-- k6 open-model executors:
-  <https://grafana.com/docs/k6/latest/using-k6/scenarios/executors/ramping-arrival-rate/>
-  (why `ramping-arrival-rate` instead of `ramping-vus` for a fixed-RPS test).
-- kind multi-node: <https://kind.sigs.k8s.io/docs/user/configuration/>
-  (3-worker config that makes pod anti-affinity meaningful).
-- kube-prometheus v0.17.0:
-  <https://github.com/prometheus-operator/kube-prometheus/releases/tag/v0.17.0>
-  (the manifests bundle this repo cherry-picks from).
+Most "weird" bench results came from the harness, not the system. macOS loopback caps, kube-proxy connection stickiness, kind scheduler starvation at low CPU limits: the bench infrastructure has its own physics worth budgeting time for.
