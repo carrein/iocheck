@@ -1,0 +1,40 @@
+# Same as overlays/rps-hpa-8 but with maxReplicaCount=4 — tests whether a
+# very tight horizontal ceiling outperforms 8.
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: iocheck-rps
+  namespace: iocheck
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: iocheck
+  pollingInterval: 15
+  cooldownPeriod: 60
+  minReplicaCount: 2
+  maxReplicaCount: 4
+  fallback:
+    failureThreshold: 3
+    replicas: 3
+    behavior: currentReplicasIfHigher
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 0
+          policies:
+            - { type: Percent, value: 100, periodSeconds: 15 }
+            - { type: Pods,    value: 4,   periodSeconds: 15 }
+        scaleDown:
+          stabilizationWindowSeconds: 60
+          policies:
+            - { type: Percent, value: 25, periodSeconds: 60 }
+  triggers:
+    - type: prometheus
+      metricType: AverageValue
+      metadata:
+        serverAddress: http://prometheus-k8s.monitoring.svc:9090
+        query: sum(rate(http_requests_total{service="iocheck"}[1m]))
+        threshold: "100"
+        activationThreshold: "5"

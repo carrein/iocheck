@@ -19,17 +19,13 @@
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
       "id": 1,
       "title": "Replica count",
+      "description": "Actual ready iocheck replicas. KEDA's `desired` count is omitted — it tracks `running` almost identically (pods come up in seconds), so it added a redundant overlay.",
       "type": "timeseries",
       "targets": [
         {
-          "expr": "kube_deployment_status_replicas{namespace=\"iocheck\",deployment=\"iocheck\"}",
+          "expr": "kube_deployment_status_replicas_ready{namespace=\"iocheck\",deployment=\"iocheck\"}",
           "legendFormat": "running",
           "refId": "A"
-        },
-        {
-          "expr": "kube_horizontalpodautoscaler_status_desired_replicas{namespace=\"iocheck\"}",
-          "legendFormat": "desired (HPA)",
-          "refId": "B"
         }
       ]
     },
@@ -46,6 +42,7 @@
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
       "id": 2,
       "title": "RPS per pod  (KEDA target: 100)",
+      "description": "Per-pod request rate (cluster RPS / ready replicas). The yellow line at 100 is KEDA's scaling threshold — above it KEDA wants to scale up, below it wants to scale down. It's the *only* signal the rps-hpa overlay reacts to.",
       "type": "timeseries",
       "targets": [
         {
@@ -55,7 +52,7 @@
         },
         {
           "expr": "100",
-          "legendFormat": "target",
+          "legendFormat": "KEDA threshold",
           "refId": "B"
         }
       ]
@@ -80,20 +77,21 @@
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
       "id": 3,
       "title": "Latency (target p99 < 200ms)",
+      "description": "Each quantile is gated on `sum(rate(http_requests_total[1m])) > 50` so the histogram-tail artifact at drain-end (small denominator amplifies stale bucket counts → fake 5s spikes) doesn't render. Real latency only.",
       "type": "timeseries",
       "targets": [
         {
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(http_request_duration_seconds_bucket{service=\"iocheck\",route=\"/lookup\"}[1m])))",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(http_request_duration_seconds_bucket{service=\"iocheck\",route=\"/lookup\"}[1m]))) and on() (sum(rate(http_requests_total{service=\"iocheck\"}[1m])) > 50)",
           "legendFormat": "p99",
           "refId": "A"
         },
         {
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket{service=\"iocheck\",route=\"/lookup\"}[1m])))",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket{service=\"iocheck\",route=\"/lookup\"}[1m]))) and on() (sum(rate(http_requests_total{service=\"iocheck\"}[1m])) > 50)",
           "legendFormat": "p95",
           "refId": "B"
         },
         {
-          "expr": "histogram_quantile(0.50, sum by (le) (rate(http_request_duration_seconds_bucket{service=\"iocheck\",route=\"/lookup\"}[1m])))",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(http_request_duration_seconds_bucket{service=\"iocheck\",route=\"/lookup\"}[1m]))) and on() (sum(rate(http_requests_total{service=\"iocheck\"}[1m])) > 50)",
           "legendFormat": "p50",
           "refId": "C"
         }
@@ -119,17 +117,23 @@
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
       "id": 4,
       "title": "CPU utilization  (CPU HPA target: 70%)",
+      "description": "Two views of CPU vs. the 70% threshold. `avg (1m)` is the smoothed cluster-wide average — what the existing summary samples. `max pod (15s)` is the highest single-pod usage in the last 15s, which is much closer to what metrics-server feeds the HPA. CPU-HPA fires on the 15s view; if the max-pod line never sustains above 70%, no scale-up happens (the realistic failure mode for async-I/O workloads).",
       "type": "timeseries",
       "targets": [
         {
-          "expr": "100 * sum(rate(container_cpu_usage_seconds_total{namespace=\"iocheck\",container=\"iocheck\"}[1m])) / sum(kube_pod_container_resource_requests{namespace=\"iocheck\",container=\"iocheck\",resource=\"cpu\"})",
-          "legendFormat": "% of request",
+          "expr": "100 * sum(rate(container_cpu_usage_seconds_total{namespace=\"iocheck\",pod=~\"iocheck-.*\",image!=\"\"}[1m])) / scalar(count(kube_pod_status_ready{namespace=\"iocheck\",condition=\"true\"} > 0 and on(pod) kube_pod_info{pod=~\"iocheck-.*\"}) * 0.3)",
+          "legendFormat": "avg (1m)",
           "refId": "A"
+        },
+        {
+          "expr": "100 * max(rate(container_cpu_usage_seconds_total{namespace=\"iocheck\",pod=~\"iocheck-.*\",image!=\"\"}[15s])) / 0.3",
+          "legendFormat": "max pod (15s)",
+          "refId": "B"
         },
         {
           "expr": "70",
           "legendFormat": "HPA threshold",
-          "refId": "B"
+          "refId": "C"
         }
       ]
     },

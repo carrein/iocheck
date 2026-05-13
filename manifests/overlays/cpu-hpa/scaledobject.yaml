@@ -19,7 +19,7 @@ spec:
   pollingInterval: 15
   cooldownPeriod: 60 # only governs N->0; N->1 stabilization lives in HPA behavior below
   minReplicaCount: 2
-  maxReplicaCount: 10
+  maxReplicaCount: 8 # matches EXERCISE.md prompt baseline (min=2, max=8)
   advanced:
     horizontalPodAutoscalerConfig:
       behavior:

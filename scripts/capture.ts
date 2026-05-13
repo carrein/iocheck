@@ -5,7 +5,7 @@
 // (Ctrl-C) at any time — every write is incremental.
 //
 // Inputs (env):
-//   SCENARIO        cpu-hpa | rps-hpa
+//   SCENARIO        cpu-hpa | rps-hpa-4 | rps-hpa-8 | failure
 //   ARTIFACT_DIR    target dir (created if missing)
 //   PROM_URL        Prometheus base URL (default http://localhost:9090)
 //   POLL_INTERVAL_S sampling cadence (default 5)
@@ -24,9 +24,13 @@ const ARTIFACT_DIR = process.env.ARTIFACT_DIR ?? `artifacts/${SCENARIO}-${Date.n
 const PROM_URL = process.env.PROM_URL ?? "http://localhost:9090";
 const POLL_INTERVAL_S = Number(process.env.POLL_INTERVAL_S ?? 5);
 const KUBECTL = process.env.KUBECTL ?? "kubectl";
-const MODE = process.env.MODE ?? "hot";
+const MODE = process.env.MODE ?? "miss80";
 const TARGET_RPS = process.env.TARGET_RPS ?? "1000";
-const CACHE_BUSTER = process.env.CACHE_BUSTER ?? "off";
+const MISS_RATE = process.env.MISS_RATE ?? "0.8";
+// Blackout knobs (only set for bench-failure). Used to render a dedicated
+// summary section showing how the HPA behaved across the Prometheus outage.
+const BLACKOUT_AT_S = Number(process.env.BLACKOUT_AT_S ?? "");
+const BLACKOUT_DUR_S = Number(process.env.BLACKOUT_DUR_S ?? "");
 const NAMESPACE = "iocheck";
 const DEPLOYMENT = "iocheck";
 
@@ -41,6 +45,8 @@ const samples: Array<{
   replicas_desired: number;
   hpa_current?: string;
   hpa_target?: string;
+  scaling_active?: string;
+  scaling_active_reason?: string;
 }> = [];
 
 interface PromResponse {
@@ -129,6 +135,47 @@ async function kubectlJson<T>(...args: string[]): Promise<T | null> {
   });
 }
 
+async function kubectlText(...args: string[]): Promise<string | null> {
+  return new Promise((resolve) => {
+    const p = spawn(KUBECTL, args);
+    const chunks: Buffer[] = [];
+    p.stdout.on("data", (c: Buffer) => chunks.push(c));
+    p.on("close", (code) => {
+      if (code !== 0) return resolve(null);
+      resolve(Buffer.concat(chunks).toString());
+    });
+    p.on("error", () => resolve(null));
+  });
+}
+
+const nodeSamples: Array<{ t: string; node: string; cpu_m: number; cpu_pct: number; mem_mi: number; mem_pct: number }> = [];
+
+async function sampleNodes(): Promise<void> {
+  // `kubectl top nodes` output is fixed-width:
+  //   NAME  CPU(cores)  CPU(%)  MEMORY(bytes)  MEMORY(%)
+  // We parse it as whitespace-separated. This is the same shape metrics-server
+  // ships across versions; if the layout ever changes, the row regex below
+  // tolerates extra columns by anchoring on the first 5 fields.
+  const text = await kubectlText("top", "nodes", "--no-headers");
+  if (!text) return;
+  const t = new Date().toISOString();
+  for (const line of text.split("\n")) {
+    const m = line.trim().match(/^(\S+)\s+(\d+)m\s+(\d+)%\s+(\d+)Mi\s+(\d+)%/);
+    if (!m) continue;
+    nodeSamples.push({
+      t, node: m[1]!,
+      cpu_m: Number(m[2]), cpu_pct: Number(m[3]),
+      mem_mi: Number(m[4]), mem_pct: Number(m[5]),
+    });
+  }
+  await Bun.write(
+    `${ARTIFACT_DIR}/node-cpu.csv`,
+    "t,node,cpu_m,cpu_pct,mem_mi,mem_pct\n" +
+      nodeSamples.map((s) => `${s.t},${s.node},${s.cpu_m},${s.cpu_pct},${s.mem_mi},${s.mem_pct}`).join("\n") +
+      "\n",
+  );
+}
+
 async function sampleOnce(): Promise<void> {
   type Dep = { status?: { readyReplicas?: number; replicas?: number } };
   type HpaList = {
@@ -137,6 +184,7 @@ async function sampleOnce(): Promise<void> {
         currentReplicas?: number;
         desiredReplicas?: number;
         currentMetrics?: Array<{ external?: { current?: { averageValue?: string; value?: string } } }>;
+        conditions?: Array<{ type?: string; status?: string; reason?: string }>;
       };
       spec?: {
         metrics?: Array<{ external?: { target?: { averageValue?: string; value?: string } } }>;
@@ -156,18 +204,27 @@ async function sampleOnce(): Promise<void> {
     hpa?.spec?.metrics?.[0]?.external?.target?.averageValue ??
     hpa?.spec?.metrics?.[0]?.external?.target?.value ??
     "";
+  // ScalingActive condition tracks whether the HPA can read its metric.
+  // During the Prometheus blackout (bench-failure) this flips False with
+  // reason=FailedGetExternalMetric, then back to True once Prometheus
+  // recovers and KEDA's fallback releases the pinned replica count.
+  const scalingActiveCond = hpa?.status?.conditions?.find((c) => c.type === "ScalingActive");
+  const scalingActive = scalingActiveCond?.status ?? "";
+  const scalingActiveReason = scalingActiveCond?.reason ?? "";
   const sample = {
     t: new Date().toISOString(),
     replicas_ready: readyReplicas,
     replicas_desired: replicas,
     hpa_current: current,
     hpa_target: target,
+    scaling_active: scalingActive,
+    scaling_active_reason: scalingActiveReason,
   };
   samples.push(sample);
   await Bun.write(
     `${ARTIFACT_DIR}/replica-trajectory.csv`,
-    "t,replicas_ready,replicas_desired,hpa_current,hpa_target\n" +
-      samples.map((s) => `${s.t},${s.replicas_ready},${s.replicas_desired},${s.hpa_current ?? ""},${s.hpa_target ?? ""}`).join("\n") +
+    "t,replicas_ready,replicas_desired,hpa_current,hpa_target,scaling_active,scaling_active_reason\n" +
+      samples.map((s) => `${s.t},${s.replicas_ready},${s.replicas_desired},${s.hpa_current ?? ""},${s.hpa_target ?? ""},${s.scaling_active ?? ""},${s.scaling_active_reason ?? ""}`).join("\n") +
       "\n",
   );
 }
@@ -186,8 +243,11 @@ async function writeSummary(): Promise<void> {
 
   const peakRps = await prom(`max_over_time(sum(rate(http_requests_total{service="iocheck"}[1m]))[${w}:15s])`);
   const avgRps = await prom(`avg_over_time(sum(rate(http_requests_total{service="iocheck"}[1m]))[${w}:15s])`);
-  const peakP99 = await prom(`max_over_time(histogram_quantile(0.99, sum by (le) (rate(http_request_duration_seconds_bucket{service="iocheck",route="/lookup"}[1m])))[${w}:15s])`);
-  const avgP99 = await prom(`avg_over_time(histogram_quantile(0.99, sum by (le) (rate(http_request_duration_seconds_bucket{service="iocheck",route="/lookup"}[1m])))[${w}:15s])`);
+  // Single p99 over the whole bench window. We deliberately *don't* publish a
+  // peak p99 — `max_over_time(... [1m])` catches transient histogram-tail
+  // artifacts (scale-up bursts, drain-phase tail) that aren't representative
+  // of the workload. One run-window number is the honest headline metric.
+  const runP99 = await prom(`histogram_quantile(0.99, sum by (le) (rate(http_request_duration_seconds_bucket{service="iocheck",route="/lookup"}[${w}])))`);
   // cadvisor exposes container_cpu_usage_seconds_total via the kubelet target;
   // matching by pod prefix is more robust than the `container` label because
   // some cadvisor variants label it differently. Average per-pod usage as a
@@ -195,11 +255,16 @@ async function writeSummary(): Promise<void> {
   const peakCpu = await prom(`max_over_time((100 * avg(rate(container_cpu_usage_seconds_total{namespace="iocheck",pod=~"iocheck-.*",image!=""}[1m])) / 0.3)[${w}:15s])`);
   const avgCpu = await prom(`avg_over_time((100 * avg(rate(container_cpu_usage_seconds_total{namespace="iocheck",pod=~"iocheck-.*",image!=""}[1m])) / 0.3)[${w}:15s])`);
   const peakInflight = await prom(`max_over_time(max(iocheck_inflight_requests{service="iocheck"})[${w}:15s])`);
-  const cacheHit = await prom(`sum(rate(cache_lookups_total{service="iocheck",result="hit"}[${w}])) / sum(rate(cache_lookups_total{service="iocheck"}[${w}]))`);
-  // Non-2xx ratio across the whole bench window. Null when there were no
-  // requests at all — guard avoids dividing 0/0. 4xx counts as well as 5xx
-  // because the service should answer 200 on every valid lookup.
-  const errorRate = await prom(`sum(rate(http_requests_total{service="iocheck",status!~"2.."}[${w}])) / sum(rate(http_requests_total{service="iocheck"}[${w}]))`);
+  // `or vector(0)` so an absent "hit" series (all-miss workloads) yields 0,
+  // not null — otherwise the division returns null and the summary renders
+  // a bare "-" instead of a real "0.0%".
+  const cacheHit = await prom(`(sum(rate(cache_lookups_total{service="iocheck",result="hit"}[${w}])) or vector(0)) / clamp_min(sum(rate(cache_lookups_total{service="iocheck"}[${w}])), 1)`);
+  // Non-2xx ratio across the whole bench window. Same `or vector(0)` trick as
+  // the cache-hit query — an absent non-2xx series (zero errors, which IS the
+  // desirable case) would otherwise make the division return null and render
+  // as "-" alongside a "✗" SLO mark, falsely suggesting the metric is broken.
+  // Clamp denom to 1 to dodge 0/0 when there's no traffic at all.
+  const errorRate = await prom(`(sum(rate(http_requests_total{service="iocheck",status!~"2.."}[${w}])) or vector(0)) / clamp_min(sum(rate(http_requests_total{service="iocheck"}[${w}])), 1)`);
   const totalReqs = await prom(`sum(increase(http_requests_total{service="iocheck"}[${w}]))`);
   // Per-pod RPS + CPU over the last 1 min — Challenge #2 evidence. We want
   // an instant snapshot, not a window average, so the table reflects the
@@ -230,7 +295,7 @@ async function writeSummary(): Promise<void> {
   // SLO booleans. Each is a deterministic pass/fail check against the brief.
   // Null measurements (no data at all) count as fail — we'd rather flag a
   // broken capture than silently pass.
-  const passP99 = peakP99 !== null && peakP99 < 0.2;
+  const passP99 = runP99 !== null && runP99 < 0.2;
   const passErrorRate = errorRate !== null && errorRate < 0.01;
   // HPA-responded is informational, not pass/fail — the cpu-hpa scenario is
   // EXPECTED to hold at min (that's Challenge #1's whole point). We render
@@ -266,14 +331,92 @@ ${pods.map((p) => `| ${p} | ${(podRps.get(p) ?? 0).toFixed(1)} | ${(podCpu.get(p
 
 Spread: RPS cv=${rpsStats.cv.toFixed(1)}% (min ${rpsStats.min.toFixed(1)}, max ${rpsStats.max.toFixed(1)}) · CPU cv=${cpuStats.cv.toFixed(1)}% (min ${cpuStats.min.toFixed(0)}m, max ${cpuStats.max.toFixed(0)}m)`;
 
+  // Node-CPU summary — evidence for whether the cluster's CPU envelope is
+  // the binding constraint. Reads what sampleNodes() collected into
+  // nodeSamples[]. Peak cpu_pct across all samples × all nodes; if it's
+  // pinned near 100% during the bench, infra contention is the ceiling.
+  const workerSamples = nodeSamples.filter((s) => /worker/.test(s.node));
+  const nodeNames = [...new Set(workerSamples.map((s) => s.node))].sort();
+  const peakNodeCpu = workerSamples.length ? Math.max(...workerSamples.map((s) => s.cpu_pct)) : 0;
+  const avgNodeCpu = workerSamples.length ? workerSamples.reduce((a, b) => a + b.cpu_pct, 0) / workerSamples.length : 0;
+  const nodeSection = nodeNames.length === 0 ? "" : `
+
+## Node-CPU envelope (worker nodes only)
+Evidence for whether cluster CPU saturation is the binding constraint —
+if worker peak% sits near 100, more iocheck pods can't deliver more RPS
+because they're competing with k6 and each other for the same finite cores.
+
+| Node | Peak CPU% | Avg CPU% | Peak mem% |
+|------|----------:|---------:|----------:|
+${nodeNames.map((n) => {
+  const ns = workerSamples.filter((s) => s.node === n);
+  const p = Math.max(...ns.map((s) => s.cpu_pct));
+  const a = ns.reduce((x, s) => x + s.cpu_pct, 0) / ns.length;
+  const m = Math.max(...ns.map((s) => s.mem_pct));
+  return `| ${n} | ${p.toFixed(0)}% | ${a.toFixed(0)}% | ${m.toFixed(0)}% |`;
+}).join("\n")}
+
+Cluster-wide: peak worker CPU **${peakNodeCpu.toFixed(0)}%**, avg ${avgNodeCpu.toFixed(0)}%.`;
+
+  // Failure-mode section — only rendered if BLACKOUT_AT_S was set. Walks
+  // the trajectory samples to find when ScalingActive flipped False/True
+  // and what the replica count did across that window. This is the writeup
+  // §4 fallback claim, *measured*.
+  let failureSection = "";
+  if (Number.isFinite(BLACKOUT_AT_S) && BLACKOUT_AT_S > 0) {
+    const blackoutStartMs = startedAt.getTime() + BLACKOUT_AT_S * 1000;
+    const blackoutEndMs = blackoutStartMs + BLACKOUT_DUR_S * 1000;
+    const inBlackout = (s: { t: string }) => {
+      const ts = new Date(s.t).getTime();
+      return ts >= blackoutStartMs && ts <= blackoutEndMs;
+    };
+    const beforeBlackout = samples.filter((s) => new Date(s.t).getTime() < blackoutStartMs);
+    const duringBlackout = samples.filter(inBlackout);
+    const afterBlackout = samples.filter((s) => new Date(s.t).getTime() > blackoutEndMs);
+    const repsBefore = beforeBlackout.at(-1)?.replicas_ready ?? "—";
+    const repsAtBlackoutEnd = duringBlackout.at(-1)?.replicas_ready ?? "—";
+    const repsAfter = afterBlackout.at(-1)?.replicas_ready ?? "—";
+    // Find when ScalingActive flipped to False / back to True.
+    let scalingActiveFlipFalse: string | undefined;
+    let scalingActiveFlipTrue: string | undefined;
+    let lastActive = "";
+    for (const s of samples) {
+      if (s.scaling_active && s.scaling_active !== lastActive) {
+        if (s.scaling_active === "False" && !scalingActiveFlipFalse) scalingActiveFlipFalse = s.t;
+        if (s.scaling_active === "True" && scalingActiveFlipFalse && !scalingActiveFlipTrue) scalingActiveFlipTrue = s.t;
+        lastActive = s.scaling_active;
+      }
+    }
+    const repsMinDuring = duringBlackout.length ? Math.min(...duringBlackout.map((s) => s.replicas_ready)) : 0;
+    const repsMaxDuring = duringBlackout.length ? Math.max(...duringBlackout.map((s) => s.replicas_ready)) : 0;
+    const blackoutHeld = repsMinDuring === repsMaxDuring;
+    failureSection = `
+
+## Fallback behavior (Prometheus blackout T+${BLACKOUT_AT_S}s → T+${BLACKOUT_AT_S + BLACKOUT_DUR_S}s)
+Tests writeup §4 — when KEDA loses its metric source, does \`fallback.replicas\`
++ \`behavior: currentReplicasIfHigher\` hold the replica count steady?
+
+- Replicas just before blackout:      **${repsBefore}**
+- Replicas range during blackout:     ${repsMinDuring} → ${repsMaxDuring}  (${blackoutHeld ? "**held steady** ✓" : "moved ✗"})
+- Replicas at blackout end:           **${repsAtBlackoutEnd}**
+- Replicas after blackout (final):    **${repsAfter}**
+
+- ScalingActive flipped False at:     ${scalingActiveFlipFalse ?? "—"}
+- ScalingActive recovered True at:    ${scalingActiveFlipTrue ?? "—"}
+
+The "held steady" check is the headline: when Prometheus disappears, KEDA's
+fallback should freeze the HPA target at the current replica count rather
+than letting it drift or scale to zero.`;
+  }
+
   const md = `# Bench: ${SCENARIO} (${MODE}) @ ${startedAtIso}
 
 Duration: ${durationS}s
 Polled every: ${POLL_INTERVAL_S}s
-Workload: TARGET_RPS=${TARGET_RPS}, CACHE_BUSTER=${CACHE_BUSTER} (mode=${MODE})
+Workload: TARGET_RPS=${TARGET_RPS}, MISS_RATE=${MISS_RATE} (mode=${MODE})
 
 ## SLO check
-- p99 < 200ms:        ${passP99 ? "✓" : "✗"} (peak ${fmtMs(peakP99)})
+- p99 < 200ms:        ${passP99 ? "✓" : "✗"} (${fmtMs(runP99)})
 - error rate < 1%:    ${passErrorRate ? "✓" : "✗"} (${fmtErrPct(errorRate)} of ${fmtCount(totalReqs)} requests)
 - HPA scaled:         ${scaled ? "✓" : "✗"} (replicas ${minReplicas === 999 ? "?" : minReplicas} → ${peakReplicas} → ${finalReplicas})
 
@@ -282,8 +425,7 @@ Workload: TARGET_RPS=${TARGET_RPS}, CACHE_BUSTER=${CACHE_BUSTER} (mode=${MODE})
 |---------------------|-------|
 | Peak RPS (cluster)  | ${fmtNum(peakRps)} |
 | Avg RPS (cluster)   | ${fmtNum(avgRps)} |
-| Peak p99 latency    | ${fmtMs(peakP99)} |
-| Avg p99 latency     | ${fmtMs(avgP99)} |
+| p99 latency         | ${fmtMs(runP99)} |
 | Peak CPU %req       | ${fmtPct(peakCpu)} |
 | Avg CPU %req        | ${fmtPct(avgCpu)} |
 | Peak in-flight/pod  | ${fmtNum(peakInflight, 0)} |
@@ -298,16 +440,58 @@ Workload: TARGET_RPS=${TARGET_RPS}, CACHE_BUSTER=${CACHE_BUSTER} (mode=${MODE})
 - Peak reached:        ${scaleUpReached ?? "—"}
 - Scale-down began:    ${scaleDownAt ?? "—"}
 - Final sample:        ${samples.at(-1)?.t ?? "—"}
-${perPodSection}
+${perPodSection}${nodeSection}${failureSection}
 
 ## Files
 - \`replica-trajectory.csv\` — pod count sampled every ${POLL_INTERVAL_S}s
+- \`node-cpu.csv\` — per-worker-node CPU% sampled every ${POLL_INTERVAL_S}s
 - \`prometheus-snapshots.json\` — captured PromQL series for the test window
 - \`hpa-events.txt\` — kubectl describe hpa at end-of-test
 - \`k6-stdout.txt\` — full k6 output
 `;
 
   await Bun.write(`${ARTIFACT_DIR}/summary.md`, md);
+
+  // Structured sibling for downstream aggregators (e.g. scripts/compare.ts
+  // driven by `make bench-all`). Same numbers as the markdown table; null
+  // where the underlying Prometheus query returned no data so a consumer
+  // can distinguish "0" from "missing".
+  const summaryJson = {
+    scenario: SCENARIO,
+    mode: MODE,
+    target_rps: Number(TARGET_RPS),
+    miss_rate: Number(MISS_RATE),
+    started_at: startedAtIso,
+    ended_at: endedAt.toISOString(),
+    duration_s: durationS,
+    slo: {
+      pass_p99: passP99,
+      pass_error_rate: passErrorRate,
+      scaled,
+    },
+    key_numbers: {
+      peak_rps: peakRps,
+      avg_rps: avgRps,
+      p99_s: runP99,
+      peak_cpu_pct_request: peakCpu,
+      avg_cpu_pct_request: avgCpu,
+      peak_inflight_per_pod: peakInflight,
+      cache_hit_ratio: cacheHit,
+      error_rate: errorRate,
+      total_requests: totalReqs,
+    },
+    replicas: {
+      peak: peakReplicas,
+      min: minReplicas === 999 ? null : minReplicas,
+      final: finalReplicas,
+    },
+    timeline: {
+      scale_up_at: scaleUpAt ?? null,
+      scale_up_reached: scaleUpReached ?? null,
+      scale_down_at: scaleDownAt ?? null,
+    },
+  };
+  await Bun.write(`${ARTIFACT_DIR}/summary.json`, JSON.stringify(summaryJson, null, 2) + "\n");
 
   // Save range queries for the test window.
   const series: Record<string, unknown> = {};
@@ -319,8 +503,13 @@ ${perPodSection}
     "histogram_quantile(0.99, sum by (le) (rate(http_request_duration_seconds_bucket{service=\"iocheck\",route=\"/lookup\"}[1m])))",
     startedS, endedS, POLL_INTERVAL_S,
   );
+  // Use the same form as peakCpu above (avg per-pod usage / 0.3-core request).
+  // Earlier this divided by kube_pod_container_resource_requests, but KSM
+  // reports CPU requests in a different unit than cAdvisor reports usage in
+  // this cluster — produced readings of 10,000%+. Hardcoding 0.3 matches the
+  // deployment's CPU request and the query the HPA itself uses.
   series.cpu_pct_request = await promRange(
-    "100 * sum(rate(container_cpu_usage_seconds_total{namespace=\"iocheck\",container=\"iocheck\"}[1m])) / sum(kube_pod_container_resource_requests{namespace=\"iocheck\",container=\"iocheck\",resource=\"cpu\"})",
+    "100 * avg(rate(container_cpu_usage_seconds_total{namespace=\"iocheck\",pod=~\"iocheck-.*\",image!=\"\"}[1m])) / 0.3",
     startedS, endedS, POLL_INTERVAL_S,
   );
   // Replica trajectory is already in replica-trajectory.csv from kubectl polling;
@@ -362,6 +551,6 @@ process.on("SIGINT", () => void stop("SIGINT"));
 process.on("SIGTERM", () => void stop("SIGTERM"));
 
 while (polling) {
-  await sampleOnce();
+  await Promise.all([sampleOnce(), sampleNodes()]);
   await Bun.sleep(POLL_INTERVAL_S * 1000);
 }

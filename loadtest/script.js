@@ -2,8 +2,13 @@
 //
 // Profile (open model — ramping-arrival-rate):
 //   00:00 → 00:30   ramp 0 → TARGET_RPS (baseline)
-//   00:30 → 02:30   sustained TARGET_RPS (10x burst, matches EXERCISE.md)
-//   02:30 → 05:00   drain TARGET_RPS → 0
+//   00:30 → 02:00   sustained TARGET_RPS (90s plateau — long enough for
+//                   the slowest autoscaler (CPU-HPA, ~80s to first scale)
+//                   to react and for the faster RPS scalers to land a
+//                   distinguishable steady-state p99 reading)
+//   02:00 → 02:30   drain TARGET_RPS → 0 (fast — pushes per-pod RPS below
+//                   KEDA's threshold quickly so the post-k6 observation
+//                   window can witness scale-down kicking off)
 //
 // Why ramping-arrival-rate (not ramping-vus): we want to drive a fixed
 // throughput regardless of how fast each request returns. With VUs, slow
@@ -12,15 +17,13 @@
 //
 // Env knobs:
 //   TARGET_RPS    sustained RPS during the plateau (default 1000)
-//   CACHE_BUSTER  when "1", every request is a random IOC → 100% cache
-//                 miss, 100% DB miss. Use to put I/O pressure on pods
-//                 without driving CPU up (the regime that exposes
-//                 CPU-HPA's structural blindness on async workloads).
-//
-// Default hot/cold mix (CACHE_BUSTER unset):
-//   90% of requests hit one of 100 "hot" IOCs (deterministic values
-//        also produced by scripts/seed.ts → near-perfect cache hits)
-//   10% of requests hit "cold" IOCs (random values, miss path → DB)
+//   MISS_RATE     0..1, fraction of requests that hit a random (uncached)
+//                 IOC and so traverse the cache-miss → DB path. The
+//                 remainder hit one of 100 deterministic "hot" IOCs the
+//                 seed job inserts → near-perfect cache hit.
+//                   0.1            → realistic 90/10 hit/miss
+//                   0.8 (default)  → 80% miss / 20% hot (stress mix)
+//                   1              → all-miss DB-saturation probe
 
 import http from "k6/http";
 import { check } from "k6";
@@ -30,7 +33,10 @@ const TARGET_HOST = __ENV.TARGET_HOST || "http://iocheck.iocheck.svc:80";
 const TARGET_RPS_TOTAL = Number(__ENV.TARGET_RPS || 1000);
 const PARALLELISM = Math.max(1, Number(__ENV.PARALLELISM || 1));
 const TARGET_RPS = Math.ceil(TARGET_RPS_TOTAL / PARALLELISM);
-const CACHE_BUSTER = __ENV.CACHE_BUSTER === "1";
+const MISS_RATE_RAW = Number(__ENV.MISS_RATE);
+const MISS_RATE = Number.isFinite(MISS_RATE_RAW) && MISS_RATE_RAW >= 0 && MISS_RATE_RAW <= 1
+  ? MISS_RATE_RAW
+  : 0.8;
 
 export const options = {
   discardResponseBodies: true,
@@ -51,9 +57,9 @@ export const options = {
       preAllocatedVUs: Math.max(200, Math.ceil(TARGET_RPS * 0.3)),
       maxVUs: Math.max(500, Math.ceil(TARGET_RPS * 0.8)),
       stages: [
-        { duration: "30s", target: TARGET_RPS },
-        { duration: "2m", target: TARGET_RPS },
-        { duration: "2m30s", target: 0 },
+        { duration: "30s",  target: TARGET_RPS },
+        { duration: "1m30s", target: TARGET_RPS },
+        { duration: "30s",  target: 0 },
       ],
     },
   },
@@ -98,11 +104,9 @@ function randomCold() {
 }
 
 export default function () {
-  const target = CACHE_BUSTER
+  const target = Math.random() < MISS_RATE
     ? randomCold()
-    : Math.random() < 0.9
-    ? HOT[Math.floor(Math.random() * HOT.length)]
-    : randomCold();
+    : HOT[Math.floor(Math.random() * HOT.length)];
   const res = http.post(
     `${TARGET_HOST}/lookup`,
     JSON.stringify(target),

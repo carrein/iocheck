@@ -10,7 +10,7 @@
 #   retention                  → 6h on a kind cluster fits a 30-min demo
 #                                without ballooning disk.
 #   replicas                   → 1 for the demo; HA Prometheus is out of scope.
-#   resources                  → enough for ~10 service replicas + node/kube
+#   resources                  → enough for ≤8 iocheck replicas + node/kube
 #                                state metrics on a laptop.
 spec:
   enableRemoteWriteReceiver: true

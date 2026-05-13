@@ -18,8 +18,10 @@ spec:
   # in the k6 script, a single k6 pod with keep-alive pins all VUs to
   # whichever iocheck pods existed at TCP-connect time, leaving newly-scaled
   # replicas idle. With noConnectionReuse, a single pod runs out of source
-  # ports above ~500 RPS. Four pods, each forcing fresh TCP per request,
-  # multiplies the port budget and lets kube-proxy load-balance evenly.
+  # ports above ~500 RPS and TCP-handshake cost caps each pod at ~650 RPS.
+  # 4 pods × 250 target ≈ 1000 RPS sustained with headroom — enough to
+  # drive RPS-HPA scale-up past its 100 RPS/pod threshold without saturating
+  # the generators.
   parallelism: 4
   completions: 4
   template:
@@ -74,8 +76,12 @@ spec:
               value: "1000"
             - name: PARALLELISM
               value: "4"
-            - name: CACHE_BUSTER
-              value: "off"
+            # MISS_RATE: 0..1 fraction of requests that target a random
+            # (uncached) IOC. Sentinel "-1" means "unset" — the k6 script
+            # falls back to its 0.8 default. The Makefile substitutes the
+            # resolved value at apply time.
+            - name: MISS_RATE
+              value: "-1"
             - name: K6_PROMETHEUS_RW_SERVER_URL
               value: "http://prometheus-k8s.monitoring.svc:9090/api/v1/write"
             - name: K6_PROMETHEUS_RW_TREND_STATS
