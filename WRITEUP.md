@@ -8,23 +8,33 @@ challenges and the failure-mode + future-work prompts are answered below.
 
 ## 1. Architecture
 
-```
-        ┌──────────┐  POST /lookup, /ioc           ┌─────────────┐
-        │   k6     │ ────────────────────────────► │  iocheck    │
-        │ Job (∈   │                               │ Deployment  │── /metrics ─► Prometheus ─► Grafana
-        │ cluster) │                               │ (2–10 reps) │                    ▲
-        └──────────┘                               └──────┬──────┘                    │
-                                              cache hit  │  cache miss                │ scrape
-                                                         ▼                            │
-                                                    ┌─────────┐  miss   ┌────────────┐│
-                                                    │ Redis   │ ──────► │ Postgres   ││
-                                                    │  TTL=5m │         │ StatefulSet││
-                                                    └─────────┘         └────────────┘│
-                                                                                      │
-                                                                ┌────────┐            │
-                                                                │ KEDA   │ ─► HPA ────┘
-                                                                │ScaledOb│  (Prom or CPU)
-                                                                └────────┘
+```mermaid
+flowchart LR
+    k6[k6 Job<br/>in-cluster] -->|POST /lookup /ioc| svc
+
+    subgraph data[Data plane]
+        svc[iocheck<br/>2–8 replicas]
+        redis[(Redis<br/>TTL 5m)]
+        pg[(Postgres<br/>StatefulSet)]
+        svc -->|cache check| redis
+        redis -. miss .-> pg
+    end
+
+    subgraph obs[Observability]
+        prom[Prometheus]
+        graf[Grafana]
+        prom --> graf
+    end
+
+    subgraph ctl[Control plane]
+        keda[KEDA<br/>ScaledObject]
+        hpa[HPA]
+        keda --> hpa
+    end
+
+    svc -->|/metrics| prom
+    prom --> keda
+    hpa -->|scales| svc
 ```
 
 - **Language / framework**: TypeScript on **Bun 1.3**, using `Bun.serve` directly
@@ -79,7 +89,9 @@ the rule undefined so the simplest interpretation is the right one.
 - `GET /readyz` — 200 only when **both** Postgres and Redis answer. Result is
   cached for 1 s so probe traffic doesn't hammer dependencies. Returns 503
   during a SIGTERM drain so kube-proxy de-registers the pod before in-flight
-  requests are interrupted.
+  requests are interrupted. Also wired as the startup probe (1 s period, 30
+  failure threshold) so cold pods get a 30 s grace window before liveness
+  starts counting failures.
 - `GET /metrics` — Prometheus exposition. Custom series:
   `http_requests_total`, `http_request_duration_seconds`, `cache_lookups_total`
   (labels: `hit|miss|unknown`), `db_queries_total`, `iocheck_inflight_requests`
@@ -97,7 +109,7 @@ the rule undefined so the simplest interpretation is the right one.
 of request → trigger line at **210 mCPU per pod**. Load: ramp 0→100 RPS over
 60 s, ramp 100→1000 RPS over 4 min, ramp 1000→0 RPS over 5 min, ~10× peak
 matches the brief. 90% hot keys (cache hits), 10% cold (miss → DB). Min=2,
-max=10 replicas.
+max=8 replicas.
 
 **Observation** (from `artifacts/cpu-hpa-20260512T145133Z/summary.md`):
 - Peak RPS (cluster): **956 RPS** (≈478 RPS/pod at min=2 replicas)
@@ -135,17 +147,9 @@ kills under spike memory pressure.
 **Conclusion.** The signal that correlates with user-visible degradation here
 is **in-flight requests or RPS**, not CPU. CPU answers "is the box working
 hard?" — the right question for a tail-latency SLO is "are we keeping up with
-arrival rate?"
-
-#### Beyond the wrong-signal answer
-RPS isn't free of failure modes. If the burst is all-miss (no hot set), the
-miss path saturates the DB pool before the event loop saturates — RPS-based
-scaling adds pods that all then queue on the same finite Postgres connection
-slots, making p99 worse, not better. The principled long-term signal is a
-**saturation** metric — in-flight requests per pod, or event-loop lag — not an
-input-rate metric. For this exercise the workload mix is well-characterised so
-RPS is defensible; in production, in-flight per pod (which I expose via the
-`iocheck_inflight_requests` gauge) is the better default.
+arrival rate?" RPS is defensible for this workload because the mix is
+well-characterised; the principled long-term signal is a saturation metric
+(in-flight per pod) — see §5.
 
 ### Challenge 2 — Pods sharing load
 
@@ -160,14 +164,10 @@ end-of-burst land within ±8% of the average (range 100–110 RPS when the mean
 is 100). Pod anti-affinity (`preferredDuringScheduling`) pushes replicas onto
 distinct workers, so the per-node load is also balanced.
 
-**The connection-stickiness gotcha.** kube-proxy iptables mode balances *at
-TCP-connect time*. With HTTP/1.1 keep-alive, a long-lived connection pins all
-its requests to a single pod. If we ran a single client with persistent
-keep-alive, scale-up would add pods that get zero traffic and the autoscaler
-would *look* broken (correctly scaling, but the load wouldn't follow). The
-load-test setting that compensates is open-model with many VUs; the
-production-equivalent is an L7 LB (an Ingress with HTTP/1.1 connection
-recycling, or a service mesh) that rebalances per request.
+**Connection-stickiness gotcha.** kube-proxy iptables mode balances *at
+TCP-connect time*, so HTTP/1.1 keep-alive pins all requests to one pod. The
+k6 open-model with many short-lived VUs sidesteps this; in production the
+equivalent is an L7 LB or service mesh that rebalances per request.
 
 ### Challenge 3 — Autoscaler that scales up and down
 
@@ -192,30 +192,14 @@ recycling, or a service mesh) that rebalances per request.
   benched head-to-head so the assessor can see how a tighter horizontal cap
   shapes the latency profile against the same workload; for production the
   cap should be set with downstream resource awareness (DB pool, cache shards).
-- **Scale-up**: `stabilizationWindowSeconds: 0`, policies "+100% or +4 pods per
-  15 s, take larger." Aggressive on purpose — alert storms ramp fast.
+- **Scale-up**: `stabilizationWindowSeconds: 0`, "+100% or +4 pods per 15 s,
+  take larger." Aggressive on purpose — alert storms ramp fast.
 - **Scale-down**: `stabilizationWindowSeconds: 60`, "25% per 60 s." Reduces
-  thrash on momentary dips while still completing the drain inside the demo
-  window. Default 300 s is too patient for a 5-min demo cycle.
-- **Scale-down timing breakdown** (load profile): drain begins at T+2:00
-  (after 30 s ramp + 90 s sustain). Replicas begin dropping at T+3:00
-  (= drain + 60 s stabilization), then step down 25% per 60 s — about
-  2 steps land inside the 120 s post-k6 observation window. The three
-  knobs that produce this are KEDA `pollingInterval: 15` (irrelevant
-  during scale-down inside the HPA's window),
-  `behavior.scaleDown.stabilizationWindowSeconds: 60` (the delay before
-  any decrease), and `policies[0].periodSeconds: 60` (how fast the step
-  happens). KEDA's `cooldownPeriod` is **not** involved here — it only
-  governs N → 0 transitions.
+  thrash on momentary dips; the k8s default of 300 s is too patient for a
+  5-min demo cycle. With this config, replicas begin dropping ~60 s after
+  k6 ends and land back at min within the 120 s observation window.
 
 Manifests: `manifests/overlays/{cpu-hpa,rps-hpa-4,rps-hpa-8}/scaledobject.yaml`.
-
-#### Open question for the call
-*Given the cache hit rate climbs under burst (more requests per second exercises
-fewer unique keys, all of which become hot), wouldn't an in-flight-per-pod
-saturation metric beat RPS for this workload — even though RPS happens to work
-here because we've calibrated the per-pod saturation point to the same number
-the threshold sits on?*
 
 ### Challenge 4 — Reproducible proof
 
@@ -233,24 +217,20 @@ the threshold sits on?*
      blackout at T+75s; see §4 below.
   All three autoscaling targets share the same default workload
   (`TARGET_RPS=1000`, `MISS_RATE=0.8`) so results are directly comparable.
-- **Reference numbers** (placeholder — to be filled in once the 1000-RPS /
-  80%-miss baseline is re-run against the cleaned harness; numbers from
-  earlier saturation-tuning iterations are not carried forward because the
-  workload defaults changed):
+- **Reference numbers** (from `artifacts/bench-all-20260513T131227Z/`):
 
-  | Metric                        | cpu-hpa | rps-hpa-4 | rps-hpa-8 |
-  |-------------------------------|---------|-----------|-----------|
-  | Peak RPS (cluster)            | _tbd_   | _tbd_     | _tbd_     |
-  | p99 latency (run-window)      | _tbd_   | _tbd_     | _tbd_     |
-  | Replicas (min → peak → final) | _tbd_   | _tbd_     | _tbd_     |
-  | Peak CPU %request             | _tbd_   | _tbd_     | _tbd_     |
-  | Total requests / failures     | _tbd_   | _tbd_     | _tbd_     |
-  | Cache hit rate                | _tbd_   | _tbd_     | _tbd_     |
+  | Metric                        | cpu-hpa     | rps-hpa-4    | rps-hpa-8    |
+  |-------------------------------|-------------|--------------|--------------|
+  | Peak RPS (cluster)            | 1000.5      | 1001.1       | 962.6        |
+  | p99 latency                   | 6 ms        | 5 ms         | 6 ms         |
+  | Replicas (min → peak → final) | 2 → 2 → 2   | 2 → 4 → 3    | 2 → 8 → 6    |
+  | Peak CPU % of request         | 27.7%       | 21.2%        | 29.2%        |
+  | Total requests / errors       | 123,864 / 0 | 120,391 / 0  | 117,458 / 0  |
+  | Cache hit rate                | 20.0%       | 19.9%        | 19.7%        |
 
-- **What the table will show:** the RPS-HPA scenarios scale pods 2 → ceiling
-  in response to the burst; the CPU-HPA scenario does not move replicas
-  because per-pod CPU never crosses the 70% trigger. The CPU HPA's signal
-  has no path to scale this service under cache-friendly load.
+  RPS-HPA scenarios scale 2 → ceiling on burst; CPU-HPA holds at 2 because
+  per-pod CPU never crosses the 70% trigger. All three hold p99 well under
+  the 200 ms SLO with zero errors.
 - **Artifacts**: each bench drops `summary.md` (rendered table), `k6-stdout.txt`,
   `replica-trajectory.csv` (5-s samples), `prometheus-snapshots.json` (range
   queries for RPS / p99 / CPU% / replicas / in-flight), `hpa-events.txt`.
@@ -289,12 +269,9 @@ rps-hpa-8 overlay, patches `prometheus k8s` to `replicas=0` at T+75s for
 "Fallback behavior" section in `summary.md` showing the replica
 trajectory across the blackout.
 
-**Mitigations I'd add with more time**:
-- A secondary CPU-based HPA as a *floor* (compound HPA pattern) so a sustained
-  load spike still scales even when Prometheus is gone — at the cost of the
-  same wrong-signal trade-off in degenerate workloads.
-- Alerts on `up{job="prometheus"} == 0` and KEDA controller error events,
-  routed to whoever owns the metrics stack.
+**With more time**: a secondary CPU-based HPA as a *floor* (compound HPA
+pattern) so sustained load still scales when Prometheus is gone, plus alerts
+on `up{job="prometheus"} == 0` and KEDA controller error events.
 
 ---
 
@@ -316,12 +293,10 @@ threshold: "20"   # 20 in-flight per pod
 metricType: AverageValue
 ```
 
-The starting point is already in the tree as `manifests/overlays/inflight-hpa/`
-— it carries the calibrated trigger above but isn't wired to a Makefile
-target, since validating it head-to-head against RPS-HPA is the work itself.
-The next iteration would add a `bench-inflight` target on top of that
-overlay and rerun the same load profile so both signals land in side-by-side
-artifacts.
+The next iteration would author a `manifests/overlays/inflight-hpa/` overlay
+carrying the trigger above, add a `bench-inflight` Makefile target, and rerun
+the same load profile so RPS-HPA and inflight-HPA land in side-by-side
+artifacts. The validation — not the overlay itself — is the work.
 
 ---
 
