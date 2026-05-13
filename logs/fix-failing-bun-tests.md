@@ -7,51 +7,7 @@
 
 ## Assistant
 
-> Bash: git status
-
-## Assistant
-
-> Bash: git log --oneline -20
-
-## Assistant
-
-> Bash: git branch --show-current
-
-## Assistant
-
-> Bash: git diff --stat
-
-## Assistant
-
-> Bash: git diff .gitignore CLAUDE.md .claude/render-session.py
-
-## Assistant
-
-> Bash: ls -la src/ tests/ scripts/ manifests/ loadtest/ dashboards/ artifacts/ .claude/plans/ 2>&1 | head -...
-
-## Assistant
-
-> Bash: git remote -v
-
-## Assistant
-
-> Bash: git log -5 --format=fuller
-
-## Assistant
-
-> Bash: ls artifacts/sample/ 2>&1
-
-## Assistant
-
-> Bash: ls manifests/iocheck manifests/postgres manifests/redis manifests/monitoring manifests/overlays 2>&1
-
-## Assistant
-
-> Read: /Users/carrein/Desktop/iocheck2/package.json
-
-## Assistant
-
-> Bash: git remote -v ; echo "---" ; git config --get branch.master.remote ; echo "---no upstream check abov...
+Surveying repo state, branch, diff, and recent commits before staging.
 
 ## Assistant
 

@@ -2,45 +2,11 @@
 
 ## User
 
-why do i keep gettingrps-hpa-cold-20260512T163141Z
+why do i keep getting rps-hpa-cold-20260512T163141Z
 
 ## Assistant
 
-> Bash: find /Users/carrein/Desktop/iocheck2 -name "*rps-hpa-cold*" -o -name "*cold*" 2>/dev/null | head -50
-
-## Assistant
-
-> Bash: ls -la /Users/carrein/Desktop/iocheck2/artifacts/rps-hpa-cold-20260512T163141Z/ && grep -rn "rps-hpa...
-
-## Assistant
-
-> Read: /Users/carrein/Desktop/iocheck2/Makefile
-
-## Assistant
-
-> Read: /Users/carrein/Desktop/iocheck2/Makefile
-
-## Assistant
-
-That artifact directory comes from `make bench-rps COLD=1` — Makefile line 280 builds `artifacts/$(SCENARIO)-$(MODE)-<timestamp>` where `MODE=cold` is set when `COLD=1` (Makefile:227-229). So you're getting it because you're invoking the bench with `COLD=1`.
-
-But there's a separate issue: the directory only contains `replica-trajectory.csv` — no `summary.md`, no `k6-stdout.txt`. That means the run was killed before `capture.ts` finished writing the summary. Let me confirm what changed.
-
-## Assistant
-
-> Bash: git diff scripts/capture.ts loadtest/job.yaml loadtest/script.js Makefile | head -200
-
-## Assistant
-
-> Bash: ls -la /Users/carrein/Desktop/iocheck2/artifacts/ && cat /Users/carrein/Desktop/iocheck2/artifacts/r...
-
-## Assistant
-
-> Read: /Users/carrein/Desktop/iocheck2/scripts/capture.ts
-
-## Assistant
-
-You only have one such directory in `artifacts/`, so "keep getting" probably means "why does the name have `-cold-` in it" — not that it's regenerating.
+The artifact directory name comes from `make bench-rps COLD=1` — the Makefile builds `artifacts/$(SCENARIO)-$(MODE)-<timestamp>` where `MODE=cold` is set when `COLD=1` is passed. The recent diff made `bench-rps` forward `COLD=$(COLD)` to `_bench`, so any `make bench-rps COLD=1` invocation lands in a `rps-hpa-cold-*` dir. If you didn't intend the cold profile, drop `COLD=1` and you'll get `rps-hpa-hot-<timestamp>` instead.
 
 **Why `-cold-`**: Makefile:227-229 sets `MODE := cold` whenever `COLD=1` is passed, and Makefile:280 builds the artifact path as `artifacts/$(SCENARIO)-$(MODE)-<timestamp>`. The recent change (in your uncommitted diff) made `bench-rps` forward `COLD=$(COLD)` to `_bench`, so any `make bench-rps COLD=1` invocation lands in a `rps-hpa-cold-*` dir. If you didn't intend the cold profile, drop `COLD=1` and you'll get `rps-hpa-hot-<timestamp>` instead.
 

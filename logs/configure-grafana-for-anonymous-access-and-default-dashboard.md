@@ -178,38 +178,11 @@ Append the two latest rendered transcripts ...
 
 ## Assistant
 
-> Bash: git push 2>&1
-
 ## Assistant
 
-> Bash: git remote -v
-
-## Assistant
-
-Commits are in place but the repo has no remote configured — I won't add one without your direction.
-
-## Assistant
-
-> Bash: git log --oneline -4
-
-## Assistant
-
-```
-═══════════════════════════════════════
-  COMMIT & PUSH SUMMARY
-  Branch: master
-  Remote: (none configured — push skipped)
-═══════════════════════════════════════
-
-  Lint:  not available
-  Tests: skipped (require live Postgres + Redis; no code changes)
-
-  Commits made (local only):
-  1. 0edb951 feat: drop Grafana login wall and default to iocheck dashboard
-  2. c7a39c4 chore: update session logs
-
-  Files changed: 5  |  Insertions: 462  |  Deletions: 11
-═══════════════════════════════════════
-```
+Commits in place locally; repo has no remote configured so push was
+skipped. Two commits:
+1. `feat: drop Grafana login wall and default to iocheck dashboard`
+2. `chore: update session logs`
 
 To push, add a remote first — e.g. `git remote add origin <url> && git push -u origin master`.
