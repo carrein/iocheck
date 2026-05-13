@@ -181,32 +181,34 @@ recycling, or a service mesh) that rebalances per request.
   cache-heavy on the configured pod size before in-flight queueing kicks in.
   Target = half of saturation gives ~2× headroom on the way up before queueing
   starts hurting p99. First pick was 50 (very conservative) — bench produced
-  replicas pinned to 10 even at modest load. Settled at 100 to keep the demo
-  trajectory visible (2 → 10 only under genuine burst).
+  replicas pinned to ceiling even at modest load. Settled at 100 to keep the
+  demo trajectory visible (2 → ceiling only under genuine burst).
 - **min replicas: 2.** Required by the brief's PDB `minAvailable ≥ 2`. Also a
   pragmatic floor: a single replica cold-cache after a node failure produces a
   visible latency hit; two warm pods give continuity.
-- **max replicas: 10.** Math: target 100 RPS/pod × 10 = 1000 RPS, which is the
-  10× burst the brief calls out. Above max would scale further but produces
-  no demo signal; for production I'd cap higher with downstream resource
-  awareness (DB pool, cache shards).
+- **max replicas: 4 (tight) vs 8 (moderate).** Math: target 100 RPS/pod × 8 =
+  800 RPS, sufficient headroom over the 1000 RPS workload (the surplus comes
+  from per-pod capacity exceeding the target threshold). Both ceilings are
+  benched head-to-head so the assessor can see how a tighter horizontal cap
+  shapes the latency profile against the same workload; for production the
+  cap should be set with downstream resource awareness (DB pool, cache shards).
 - **Scale-up**: `stabilizationWindowSeconds: 0`, policies "+100% or +4 pods per
   15 s, take larger." Aggressive on purpose — alert storms ramp fast.
 - **Scale-down**: `stabilizationWindowSeconds: 60`, "25% per 60 s." Reduces
   thrash on momentary dips while still completing the drain inside the demo
   window. Default 300 s is too patient for a 5-min demo cycle.
-- **Scale-down timing breakdown** (load profile): drain begins at T+2:30
-  (after 30 s ramp + 2 min square-wave hold). Replicas begin dropping at
-  T+3:30 (= drain + 60 s stabilization), then step down 25% per 60 s from
-  10 → 2 (≈5 steps). The three knobs that produce this are KEDA
-  `pollingInterval: 15` (irrelevant during scale-down inside the HPA's
-  window), `behavior.scaleDown.stabilizationWindowSeconds: 60` (the delay
-  before any decrease), and `policies[0].periodSeconds: 60` (how fast the
-  step happens). KEDA's `cooldownPeriod` is **not** involved here — it
-  only governs N → 0 transitions.
-  *Measured T-times pending re-bench against the new 5-min load profile.*
+- **Scale-down timing breakdown** (load profile): drain begins at T+2:00
+  (after 30 s ramp + 90 s sustain). Replicas begin dropping at T+3:00
+  (= drain + 60 s stabilization), then step down 25% per 60 s — about
+  2 steps land inside the 120 s post-k6 observation window. The three
+  knobs that produce this are KEDA `pollingInterval: 15` (irrelevant
+  during scale-down inside the HPA's window),
+  `behavior.scaleDown.stabilizationWindowSeconds: 60` (the delay before
+  any decrease), and `policies[0].periodSeconds: 60` (how fast the step
+  happens). KEDA's `cooldownPeriod` is **not** involved here — it only
+  governs N → 0 transitions.
 
-Manifests: `manifests/overlays/{cpu-hpa,rps-hpa}/scaledobject.yaml`.
+Manifests: `manifests/overlays/{cpu-hpa,rps-hpa-4,rps-hpa-8}/scaledobject.yaml`.
 
 #### Open question for the call
 *Given the cache hit rate climbs under burst (more requests per second exercises
@@ -222,27 +224,33 @@ the threshold sits on?*
   fast the service can serve.
 - **Reproduction**:
   1. `make up` — clean cluster, deployed stack, seeded 10k IOCs.
-  2. `make bench-cpu` — applies CPU overlay, runs the 60s/4m/5m profile, captures
-     artifacts to `artifacts/cpu-hpa-<ts>/`.
-  3. `make bench-rps` — applies RPS overlay, same profile, artifacts to
-     `artifacts/rps-hpa-<ts>/`.
-- **Results** (measured on a 4-node kind cluster, Apple Silicon, full bench in
-  `artifacts/`):
+  2. `make bench-cpu` — applies CPU overlay, runs the 30s/90s/30s load
+     profile + 120s observation window, captures artifacts to
+     `artifacts/cpu-hpa-<mode>-<ts>/`.
+  3. `make bench-rps4` / `make bench-rps8` — RPS-HPA overlays at the two
+     ceilings, same profile, artifacts to `artifacts/rps-hpa-{4,8}-<mode>-<ts>/`.
+  4. `make bench-failure` — same rps-hpa-8 overlay with a Prometheus
+     blackout at T+75s; see §4 below.
+  All three autoscaling targets share the same default workload
+  (`TARGET_RPS=1000`, `MISS_RATE=0.8`) so results are directly comparable.
+- **Reference numbers** (placeholder — to be filled in once the 1000-RPS /
+  80%-miss baseline is re-run against the cleaned harness; numbers from
+  earlier saturation-tuning iterations are not carried forward because the
+  workload defaults changed):
 
-  | Metric                   | bench-cpu                  | bench-rps                       |
-  |--------------------------|----------------------------|---------------------------------|
-  | Peak RPS (cluster)       | 956.2                      | 956.7                           |
-  | Peak p99 latency         | **5 ms** ✅                | **16 ms** ✅                    |
-  | Replicas (min → peak → final) | 2 → **2** → 2 ❌      | 2 → **9** → 3                   |
-  | Peak CPU %request        | 20.2% (HPA threshold 70%)  | not the trigger                 |
-  | Total requests / failures| 285,029 / 0                | 285,029 / 0                     |
-  | Cache hit rate           | 89.9%                      | 89.9%                           |
+  | Metric                        | cpu-hpa | rps-hpa-4 | rps-hpa-8 |
+  |-------------------------------|---------|-----------|-----------|
+  | Peak RPS (cluster)            | _tbd_   | _tbd_     | _tbd_     |
+  | p99 latency (run-window)      | _tbd_   | _tbd_     | _tbd_     |
+  | Replicas (min → peak → final) | _tbd_   | _tbd_     | _tbd_     |
+  | Peak CPU %request             | _tbd_   | _tbd_     | _tbd_     |
+  | Total requests / failures     | _tbd_   | _tbd_     | _tbd_     |
+  | Cache hit rate                | _tbd_   | _tbd_     | _tbd_     |
 
-- **What the table shows:** the RPS-HPA scenario scales pods 2 → 9 in response
-  to the burst; the CPU-HPA scenario does not move replicas. Both keep p99
-  below 200 ms because the Bun service is fast enough to absorb 956 RPS at 2
-  pods — but only the RPS scenario would still be safe if the workload grew
-  further. The CPU HPA's signal has no path to scale this service ever.
+- **What the table will show:** the RPS-HPA scenarios scale pods 2 → ceiling
+  in response to the burst; the CPU-HPA scenario does not move replicas
+  because per-pod CPU never crosses the 70% trigger. The CPU HPA's signal
+  has no path to scale this service under cache-friendly load.
 - **Artifacts**: each bench drops `summary.md` (rendered table), `k6-stdout.txt`,
   `replica-trajectory.csv` (5-s samples), `prometheus-snapshots.json` (range
   queries for RPS / p99 / CPU% / replicas / in-flight), `hpa-events.txt`.
@@ -265,7 +273,8 @@ is affected.
 
 **Mitigation in place**:
 - KEDA `fallback.replicas: 4` — mid-load floor. Neither starves at min nor
-  thunders to max. Configured in `manifests/overlays/rps-hpa/scaledobject.yaml`.
+  thunders to max. Configured in `manifests/overlays/rps-hpa-8/scaledobject.yaml`
+  (and the equivalent `replicas: 3` in `rps-hpa-4/`).
 - `behavior: currentReplicasIfHigher` — holds the current replica count if
   it's already above the fallback floor, otherwise lifts to 4. Beats `static`,
   which would *down-scale* us to 4 even if we were already at 8 mid-burst —
@@ -273,13 +282,12 @@ is affected.
   production recommendation. Requires KEDA ≥ 2.17.
 - The PDB (`minAvailable: 2`) ensures the fallback never violates the floor.
 
-**Reproduction** (manual, not part of the standard bench): scale Prometheus
-to zero mid-burst:
-```bash
-.bin/kubectl scale -n monitoring deployment/prometheus-k8s --replicas=0
-# ~45s later:
-.bin/kubectl get hpa -n iocheck  # shows fallback active, replicas pinned at 4
-```
+**Reproduction**: now reproducible via `make bench-failure` — applies the
+rps-hpa-8 overlay, patches `prometheus k8s` to `replicas=0` at T+75s for
+90s, then restores. The capture script tracks the KEDA-HPA's
+`ScalingActive` condition across the window and renders a dedicated
+"Fallback behavior" section in `summary.md` showing the replica
+trajectory across the blackout.
 
 **Mitigations I'd add with more time**:
 - A secondary CPU-based HPA as a *floor* (compound HPA pattern) so a sustained
@@ -308,10 +316,12 @@ threshold: "20"   # 20 in-flight per pod
 metricType: AverageValue
 ```
 
-I'd validate with the same bench harness, plus a synthetic "all-miss" workload
-that today is a writeup-only edge case — wire it up as `make bench-rps-miss`
-and `make bench-inflight-miss` and let the assessor see both signals at
-saturation.
+The starting point is already in the tree as `manifests/overlays/inflight-hpa/`
+— it carries the calibrated trigger above but isn't wired to a Makefile
+target, since validating it head-to-head against RPS-HPA is the work itself.
+The next iteration would add a `bench-inflight` target on top of that
+overlay and rerun the same load profile so both signals land in side-by-side
+artifacts.
 
 ---
 

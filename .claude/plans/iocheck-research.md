@@ -80,7 +80,7 @@ await db.begin(async tx => {
 Features that matter for us:
 - Tagged template literals with parameter substitution (SQL-injection safe).
 - Connection pooling built in (`max`, `idleTimeout`, `maxLifetime`).
-- Named prepared statements by default (`prepare: false` if fronting with PgBouncer in transaction mode — PgBouncer 1.21+ does support named prepared statements but only when explicitly configured).
+- Named prepared statements by default.
 - Transactions via `db.begin(async tx => ...)`, savepoints via `tx.savepoint`.
 - Bulk insert helper: `await db\`INSERT INTO iocs ${db(records)}\`` expands an array of objects.
 - `db`.simple()` for multi-statement migration scripts (no params allowed).
@@ -682,7 +682,7 @@ spec:
 Tradeoff callouts (mention these in the writeup):
 - Single replica = no HA. For a production system, use CloudNativePG operator or Zalando postgres-operator (handles streaming replication, PITR backups, failover).
 - `storageClassName: standard` resolves to kind's default `local-path` provisioner — node-local, lost if you delete the kind cluster.
-- No connection pooler (PgBouncer). Bun.sql's pool is in-process per pod. Under heavy autoscaling, pod count × pool size can exhaust Postgres connections. With `max: 20` per pod and `max_connections=100` (Postgres default), you cap at 5 pods before contention. Either lower `max` to 10 per pod, raise Postgres `max_connections` to 200, or add PgBouncer as a sidecar.
+- No external connection pooler. Bun.sql's pool is in-process per pod. Under heavy autoscaling, pod count × pool size can exhaust Postgres connections. With `max: 20` per pod and `max_connections=100` (Postgres default), you cap at 5 pods before contention. Either lower `max` to 10 per pod or raise Postgres `max_connections` to 200.
 
 ### 6.2 Init job for schema + seed 10k IOCs
 

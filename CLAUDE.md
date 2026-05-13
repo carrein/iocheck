@@ -15,14 +15,42 @@ in-repo config rather than user-global `~/.claude`. Run `direnv allow` after clo
 
 ## Assessor-facing surface
 
-Exactly four Make targets. Anything more granular is a private `.`-prefixed phase.
+Seven Make targets — bring-up / tear-down, four bench scenarios, plus the
+`bench-all` aggregator that runs the three throughput benches under a single
+run dir. Anything more granular is a private `.`-prefixed phase.
 
 ```
-make up         # download .bin/{kind,kubectl}, create cluster, deploy, seed 10k IOCs
-make bench-cpu  # CPU-HPA scenario + 10-min load + Grafana + artifacts/
-make bench-rps  # RPS-HPA scenario + 10-min load + Grafana + artifacts/
-make down       # destroy cluster, remove .bin/, keep artifacts/
+make up              # download .bin/{kind,kubectl}, create cluster, deploy, seed 10k IOCs
+make bench-cpu       # CPU-HPA scenario              + load + Grafana + artifacts/
+make bench-rps4      # RPS-HPA (max=4, tight)        + load + Grafana + artifacts/
+make bench-rps8      # RPS-HPA (max=8, moderate)     + load + Grafana + artifacts/
+make bench-failure   # RPS-HPA + Prometheus blackout (writeup §4 fallback)
+make bench-all       # cpu + rps4 + rps8 → artifacts/bench-all-<ts>/comparison.md
+make down            # destroy cluster, remove .bin/, keep artifacts/
 ```
+
+All `bench-*` targets share the same default workload — `MISS_RATE=0.8`,
+`TARGET_RPS=1000` — so the results are directly comparable. Override per run
+(e.g. `MISS_RATE=0.1` for a hot-mix probe). Profile: 30s ramp + 90s sustain
++ 30s drain + 2 min post-k6 observation window for scale-down capture.
+
+`bench-failure` is the writeup §4 fallback validation: it reuses the
+rps-hpa-8 overlay and patches the Prometheus StatefulSet to replicas=0
+at T+75s (held for 90s) to test KEDA's `fallback.replicas` +
+`behavior: currentReplicasIfHigher` claim. The `capture.ts` script polls
+the KEDA-HPA's `ScalingActive` condition so the fallback fire moment is
+captured in `summary.md`.
+
+`bench-all` runs cpu-hpa + rps-hpa-4 + rps-hpa-8 sequentially (excludes
+`bench-failure` — that asks a different question) under a single
+`artifacts/bench-all-<ts>/` root, and emits `comparison.md` with a
+side-by-side headline table. The aggregator (`scripts/compare.ts`) reads
+each sub-bench's `summary.json` (a sibling to `summary.md` produced by
+`capture.ts`); a missing `summary.json` is treated as a failed sub-bench
+and rendered as a flagged row. `_bench` honors an external `ARTIFACT_DIR`
+env var (set by `bench-all`) so all three sub-benches write into the
+shared run dir; standalone `bench-*` invocations keep the legacy
+`artifacts/<scenario>-<mode>-<ts>/` sibling layout.
 
 Host floor: Docker + git + make. Bun, kubectl, kind, KEDA, kube-prometheus, k6 —
 all downloaded or cluster-installed by `make up`.
@@ -33,14 +61,15 @@ all downloaded or cluster-installed by `make up`.
   `admin.ts`, `shutdown.ts`, `types.ts`)
 - `tests/` — `bun:test` suite (`setup.ts` creates an ephemeral schema)
 - `scripts/` — `bootstrap.sh` (kind/kubectl downloader), `seed.ts` (10k IOCs),
-  `capture.ts` (bench artifact generator)
+  `capture.ts` (bench artifact generator), `compare.ts` (bench-all aggregator)
 - `manifests/` — namespace, postgres, redis, iocheck, monitoring patches,
-  Kustomize overlays under `manifests/overlays/{cpu-hpa,rps-hpa}/`
+  Kustomize overlays under `manifests/overlays/{cpu-hpa,rps-hpa-4,rps-hpa-8}/`
 - `loadtest/` — k6 script, ConfigMap, Job
 - `dashboards/` — Grafana dashboard JSON, auto-imported by `make up`
 - `Dockerfile`, `docker-compose.yml`, `kind-config.yaml`, `Makefile`
-- `.claude/plans/iocheck-plan.md` + `iocheck-research.md` — durable design context;
-  read these before re-deriving decisions or proposing changes to calibrated values
+- `.claude/plans/iocheck-plan.md` + `iocheck-research.md` + `bench-all-plan.md` —
+  durable design context; read these before re-deriving decisions or proposing
+  changes to calibrated values
 - `.claude/projects/.../memory/` — per-project memory (user preferences, project facts)
 
 ## Claude infrastructure

@@ -1,10 +1,15 @@
 # iocheck — Implementation Plan
 Created: 2026-05-12
+Last revised: 2026-05-13 (bench-all + four-way grid landed; see `bench-all-plan.md`)
 Status: COMPLETE
 
 ## Context
 
-Take-home challenge (`EXERCISE.md`): build a small **threat-intel IOC lookup service** in TypeScript on Bun, deploy to a local **kind** Kubernetes cluster, demonstrate **custom-metric autoscaling** that beats a CPU-based HPA. Assessed via a 30-min walkthrough where pods must visibly scale 2 → ~10 → 2 in response to a 10× RPS burst, while p99 stays under 200 ms.
+Take-home challenge (`EXERCISE.md`): build a small **threat-intel IOC lookup
+service** in TypeScript on Bun, deploy to a local **kind** Kubernetes cluster,
+and demonstrate **custom-metric autoscaling** that beats a CPU-based HPA.
+Assessed via a 30-min walkthrough where pods must visibly scale 2 → ~max → 2 in
+response to a 10× RPS burst, while p99 stays under 200 ms.
 
 **Hard requirements from EXERCISE.md:**
 - `POST /lookup` (`{type, value}` → `{verdict, ioc?}`), `POST /ioc` (admin upsert), `GET /healthz` (liveness), `GET /readyz` (DB+cache reachable), `GET /metrics` (Prometheus)
@@ -14,38 +19,68 @@ Take-home challenge (`EXERCISE.md`): build a small **threat-intel IOC lookup ser
 - Containerized, k8s manifests, liveness/readiness/startup probes, **PDB minAvailable ≥ 2**, resource requests + limits
 - HPA driven by **a signal that actually correlates with the workload** (CPU 70% is documented to fail)
 
-**User-added constraints (Phase 1 questioning):**
+**Self-imposed constraints (Phase 1 design):**
 1. Reproducible — assessor pulls repo, runs on Docker, minimal host deps
 2. Bun runtime — use built-in TS, Bun.serve, bun:test, Bun.sql, Bun.redis where production-ready
-3. Isolated example — careful calibration of values and load shapes
+3. Calibrated example — every value defensible, every load shape commented
 
-**Calibrated workload values (settled in Phase 1):**
+**Calibrated values (final):**
 - Pod resources: requests **300m CPU / 128Mi mem**, limits **1000m / 256Mi**
-- Replicas: **min 2, max 10**
+- Replicas: **min=2** for every overlay; **max=8** for `cpu-hpa` (matches the
+  EXERCISE.md baseline of `min=2, max=8`); **max=4** for `rps-hpa-4` (tight
+  ceiling); **max=8** for `rps-hpa-8` (moderate ceiling)
 - HPA "bad" signal: **CPU 70% of request** (the exercise baseline)
-- HPA "good" signal: **RPS = 100 / pod** (or in-flight = 20 / pod — RPS is the primary choice for explainability)
-- Baseline load: **100 RPS**; burst: **1000 RPS** (10× per spec); burst hold **4 min**; drain **5 min**
-- DB pool per pod: **10**; cache TTL **5 min**; seeded IOCs **10 000** (hot ~100 keys queried 90% of the time)
+- HPA "good" signal: **RPS = 100 / pod** via Prometheus trigger; in-flight per
+  pod is the principled long-term alternative (writeup §5)
+- Workload: **TARGET_RPS=1000** flat, **MISS_RATE=0.8** default (80% miss /
+  20% hot). `MISS_RATE=0.1` is the hot-mix probe; `MISS_RATE=1.0` is the
+  cache-bypass DB-saturation probe.
+- k6 profile: **30s ramp + 90s sustain + 30s drain + 120s post-observe**
+  (~5 min wall-clock per bench). 90s sustain is enough for the slowest
+  autoscaler (CPU-HPA, ~80s to first scale) to react; 120s post-observe
+  captures the first scale-down steps.
+- DB pool per pod: **10**; cache TTL **5 min** (hits) / **60 s** (miss
+  tombstones); seeded IOCs **10 000** (~100 hot keys queried 90% of the time)
 
 ---
 
 ## Research Summary
 
-Full notes in `.claude/plans/iocheck-research.md`. The findings that materially shape this plan:
+Full notes in `iocheck-research.md`. The findings that materially shaped this plan:
 
-- **Bun.sql + Bun.redis** are production-ready for this use case (read-heavy lookups, simple upserts, GET/SET cache). Caveats documented; not blockers. Fallback to `porsager/postgres` / `ioredis` is one import-swap if needed.
-- **prom-client@^15.1.2** works on Bun, but **must not call `collectDefaultMetrics()`** — it crashes on `monitorEventLoopDelay`. Hand-pick metrics; expose `server.pendingRequests` as an in-flight gauge.
-- **Bun.serve** has **no built-in SIGTERM** handler and an aggressive **10 s idleTimeout** that includes handler time. Must hand-wire the shutdown sequence (fail readyz → sleep → `server.stop()` → close pools) and raise idleTimeout for slow miss-path queries.
-- **KEDA 2.19** via single-manifest install; `metricType: AverageValue` causes HPA to divide the metric by replica count internally — **PromQL must return cluster-total, not per-pod**. `cooldownPeriod` is N→0 only; N→1 stabilization lives under `advanced.horizontalPodAutoscalerConfig.behavior.scaleDown.stabilizationWindowSeconds`. `fallback.replicas` covers the "Prometheus down" failure mode.
-- **kube-prometheus v0.17.0** (manifest, not chart) gives Prometheus + Grafana + Operator pre-wired. **Must patch the Prometheus CR with `enableRemoteWriteReceiver: true`** for k6 push to work — Prometheus 3.x silently 404s otherwise. Drop alertmanager + blackbox-exporter to fit a laptop RAM budget.
-- **kind v0.31.0** with `kindest/node:v1.32.0`, 3 workers + 1 control-plane, `extraPortMappings` for NodePort access. `kind load docker-image iocheck:dev` after every rebuild. **No `:latest` tags** (pull-always footgun).
-- **k6 v2.0.0** as an in-cluster Job — `ramping-arrival-rate` (open model, fixed RPS targets), **not** `ramping-vus`. Push metrics via `--out=experimental-prometheus-rw`.
+- **Bun.sql + Bun.redis** are production-ready for this use case (read-heavy
+  lookups, simple upserts, GET/SET cache). Caveats documented; not blockers.
+  Fallback to `porsager/postgres` / `ioredis` is one import-swap if needed.
+- **prom-client@^15.1.2** works on Bun, but **must not call `collectDefaultMetrics()`** —
+  it crashes on `monitorEventLoopDelay`. Hand-pick metrics; expose
+  `server.pendingRequests` as the in-flight gauge.
+- **Bun.serve** has **no built-in SIGTERM** handler and an aggressive **10s
+  idleTimeout** that includes handler time. Must hand-wire the shutdown
+  sequence (fail readyz → sleep → `server.stop()` → close pools) and raise
+  idleTimeout for slow miss-path queries.
+- **KEDA 2.19** via single-manifest install; `metricType: AverageValue` causes
+  HPA to divide the metric by replica count internally — **PromQL must return
+  cluster-total, not per-pod**. `cooldownPeriod` is N→0 only; N→1 stabilization
+  lives under `advanced.horizontalPodAutoscalerConfig.behavior.scaleDown.stabilizationWindowSeconds`.
+  `fallback.replicas` covers the "Prometheus down" failure mode.
+- **kube-prometheus v0.17.0** (manifest, not chart) gives Prometheus + Grafana +
+  Operator pre-wired. **Must patch the Prometheus CR with
+  `enableRemoteWriteReceiver: true`** for k6 push to work — Prometheus 3.x
+  silently 404s otherwise. Drop alertmanager + blackbox-exporter to fit a
+  laptop RAM budget.
+- **kind v0.31.0** with `kindest/node:v1.32.0`, 3 workers + 1 control-plane,
+  `extraPortMappings` for NodePort access. `kind load docker-image iocheck:dev`
+  after every rebuild. **No `:latest` tags** (pull-always footgun).
+- **k6 v2.0.0** as an in-cluster Job — `ramping-arrival-rate` (open model,
+  fixed RPS targets), **not** `ramping-vus`. Push metrics via
+  `--out=experimental-prometheus-rw`.
 
 ---
 
 ## Approach
 
-Single committed approach; no fork in the design. Alternatives belong in the writeup, not the implementation.
+Single committed approach; no fork in the design. Alternatives belong in the
+writeup, not the implementation.
 
 **Architecture (logical):**
 
@@ -96,268 +131,279 @@ Single committed approach; no fork in the design. Alternatives belong in the wri
 
 ### Phase A — Service core (Bun + TypeScript)
 
-Files affected: `package.json`, `bun.lock`, `tsconfig.json`, `src/server.ts`, `src/db.ts`, `src/cache.ts`, `src/metrics.ts`, `src/lookup.ts`, `src/admin.ts`, `src/shutdown.ts`, `src/types.ts`
+Files: `package.json`, `bun.lock`, `tsconfig.json`, `src/{server,db,cache,metrics,lookup,admin,shutdown,types}.ts`
 
-- [ ] `bun init` skeleton; `package.json` with scripts (`dev`, `start`, `test`, `test:integration`, `seed`, `build`); pin Bun version in `engines`
-- [ ] `tsconfig.json` strict, `target: ESNext`, `moduleResolution: Bundler`
-- [ ] `src/types.ts` — `IOCType = 'ip' | 'domain' | 'sha256'`, `IOC`, `LookupResult` (matching EXERCISE.md verdict shape)
-- [ ] `src/db.ts` — `Bun.sql` client; `max: 10`, `idleTimeout: 30`, `connectionTimeout: 10`; `findIoc(type, value)`, `upsertIoc(ioc)` (with `ON CONFLICT (type, value) DO UPDATE`)
-- [ ] `src/cache.ts` — `Bun.redis` client; key shape `ioc:{type}:{value}`; `get`/`setex` 300s TTL; `del` for invalidation; tombstone "unknown" cached with shorter TTL (60s) to absorb miss-path bursts
-- [ ] `src/metrics.ts` — `prom-client` Registry (no defaults), counters/histograms: `http_requests_total{method,route,status}`, `http_request_duration_seconds`, `cache_lookups_total{result=hit|miss|unknown}`, `db_queries_total{op}`. Gauge `iocheck_inflight_requests` driven by `setInterval(() => g.set(server.pendingRequests), 1000)`
-- [ ] `src/lookup.ts` — read-through: cache.get → if hit, return; else db.findIoc → cache.set → return. Return shape conforms to EXERCISE.md (`verdict`, `ioc?`)
-- [ ] `src/admin.ts` — `X-Admin-Token` header check against `ADMIN_TOKEN` env var; upsert via db; **cache.del after upsert** (invalidation)
-- [ ] `src/server.ts` — `Bun.serve` with `routes`: `POST /lookup`, `POST /ioc`, `GET /healthz`, `GET /readyz`, `GET /metrics`. Wrap each route with timing middleware. `idleTimeout: 30`. `readyz` checks Redis PING + Postgres `SELECT 1` (last-known-good with 1s TTL to avoid hammering)
-- [ ] `src/shutdown.ts` — `process.on("SIGTERM"|"SIGINT", shutdown)`: set `isReady=false` → `sleep(5s)` → `server.stop()` → `sql.close()` → `redis.close()` → `process.exit(0)`
-
-**Checks at end of Phase A:** `bun run start` against local `docker run` of Postgres + Redis; `curl /healthz`, `curl /readyz`, `curl POST /lookup`, `curl POST /ioc`, `curl /metrics`.
+Built `bun init` skeleton with strict TS (`target: ESNext`, `moduleResolution:
+Bundler`). `src/types.ts` declares `IOCType = 'ip' | 'domain' | 'sha256'`,
+`IOC`, and the EXERCISE.md verdict response shape. `src/db.ts` wraps `Bun.sql`
+with `max: 10`, named-prepared `findIoc(type, value)` and `upsertIoc(ioc)`
+(with `ON CONFLICT (type, value) DO UPDATE`). `src/cache.ts` wraps `Bun.redis`
+with `ioc:{type}:{value}` keys, 300s hit TTL, 60s miss-tombstone TTL, and
+`del`-on-upsert invalidation. `src/metrics.ts` registers per-route counters
+and histograms plus the `iocheck_inflight_requests` gauge sampled from
+`server.pendingRequests`. `src/lookup.ts` implements the read-through path.
+`src/admin.ts` checks an `X-Admin-Token` header against the `ADMIN_TOKEN`
+env var. `src/server.ts` is `Bun.serve` with `routes`, timing middleware,
+and a `readyz` that PINGs Redis + `SELECT 1`s Postgres with a 1s
+last-known-good cache. `src/shutdown.ts` fails readyz → sleeps → calls
+`server.stop()` → closes both pools.
 
 ### Phase B — Tests
 
-Files: `tests/setup.ts`, `tests/lookup.test.ts`, `tests/admin.test.ts`, `tests/metrics.test.ts`
+Files: `tests/{setup,lookup,admin,metrics}.test.ts`
 
-- [ ] `tests/setup.ts` — preload; create ephemeral schema (`test_<uuid8>`), `SET search_path`, drop on exit; skip suite if `DATABASE_URL` / `REDIS_URL` unset (CI gate)
-- [ ] `tests/lookup.test.ts` — known-malicious returns `{verdict:"malicious",ioc:{...}}`; unknown returns `{verdict:"unknown"}` with no `ioc` field; malformed body 400; unsupported `type` 400
-- [ ] `tests/admin.test.ts` — happy upsert 201, returns same shape; missing/wrong token 401; upsert is idempotent (no duplicate row); upsert **invalidates** the cached entry
-- [ ] `tests/metrics.test.ts` — `/metrics` returns 200 with `text/plain`; `http_requests_total` increments by 1 after one request; `cache_lookups_total{result="hit"}` increments after second identical lookup
-
-**Checks:** `bun test` green.
+`setup.ts` is a preload that creates a per-run ephemeral schema
+(`test_<uuid8>`), points `search_path` at it, and drops on exit. Suites skip
+if `DATABASE_URL`/`REDIS_URL` aren't reachable (CI gate). `lookup.test.ts`
+covers known-malicious vs unknown vs malformed body. `admin.test.ts` covers
+auth, idempotency, and cache invalidation after upsert. `metrics.test.ts`
+asserts `/metrics` shape and that counters increment correctly.
 
 ### Phase C — Dockerfile + dev compose
 
-Files: `Dockerfile`, `.dockerignore`, `docker-compose.yml`
-
-- [ ] Multi-stage Dockerfile (`deps` → `runtime` on `oven/bun:1.3-slim`), `USER bun`, `EXPOSE 3000`, HEALTHCHECK against `/readyz`. ENTRYPOINT `["bun", "run", "src/server.ts"]`
-- [ ] `.dockerignore` excludes `tests/`, `.claude/`, `logs/`, `manifests/`, `loadtest/`, `node_modules/`
-- [ ] `docker-compose.yml` — three services (iocheck, postgres, redis) with healthchecks and `depends_on: condition: service_healthy`. Bind-mount `src/` for fast iteration. Exposes 3000 to host.
-
-**Checks:** `docker compose up` → curl works; `docker build -t iocheck:dev .` produces an image under ~150 MB.
+Multi-stage Dockerfile (`deps` → `runtime` on `oven/bun:1.3-slim`),
+`USER bun`, HEALTHCHECK against `/readyz`, ENTRYPOINT
+`["bun", "run", "src/server.ts"]`. `.dockerignore` excludes `tests/`,
+`.claude/`, `logs/`, `manifests/`, `loadtest/`, `scripts/`, `node_modules/`.
+`docker-compose.yml` is for host-side dev with bind-mounted `src/`.
 
 ### Phase D — k8s manifests (cluster + service + data plane)
 
-Files: `kind-config.yaml`, `manifests/namespace.yaml`, `manifests/iocheck/{deployment,service,pdb,configmap,secret,servicemonitor}.yaml`, `manifests/postgres/{statefulset,service,pvc,secret,init-configmap,seed-job}.yaml`, `manifests/redis/{deployment,service}.yaml`
+Files: `kind-config.yaml`, `manifests/namespace.yaml`,
+`manifests/iocheck/{deployment,service,pdb,configmap,secret,servicemonitor}.yaml`,
+`manifests/postgres/{statefulset,secret,init-configmap,seed-job}.yaml`,
+`manifests/redis/{deployment}.yaml`
 
-- [ ] `kind-config.yaml` — 3 workers + 1 control-plane; `extraPortMappings` for 30080→8080 (iocheck), 30090→9090 (Prometheus), 30030→3000 (Grafana)
-- [ ] `manifests/iocheck/deployment.yaml`:
-  - Image `iocheck:dev`, `imagePullPolicy: IfNotPresent`
-  - Resources: requests `cpu: 300m, memory: 128Mi`; limits `cpu: 1000m, memory: 256Mi`
-  - Probes: `livenessProbe` on `/healthz` (period 10s); `readinessProbe` on `/readyz` (period 5s); `startupProbe` on `/readyz` (failureThreshold 30, period 1s)
-  - `terminationGracePeriodSeconds: 30`
-  - Pod anti-affinity (preferredDuringScheduling, `topologyKey: kubernetes.io/hostname`) so replicas spread across the 3 workers (**addresses challenge #2: "make sure pods share load"**)
-  - Env: `DATABASE_URL`, `REDIS_URL`, `ADMIN_TOKEN` (from secret), `PORT=3000`, `NODE_ENV=production`
-- [ ] `manifests/iocheck/pdb.yaml` — `minAvailable: 2` (matches min replicas)
-- [ ] `manifests/iocheck/service.yaml` — ClusterIP + NodePort 30080 (one Service, both serve)
-- [ ] `manifests/iocheck/servicemonitor.yaml` — `labels: {release: prometheus}` to match operator selector; scrape `/metrics` every 10s
-- [ ] `manifests/postgres/statefulset.yaml` — `postgres:17-alpine`, 1 replica, PVC 2Gi (`storageClassName: standard` → kind's local-path), `pg_isready` readinessProbe, `max_connections=200` via init args
-- [ ] `manifests/postgres/init-configmap.yaml` — `001-schema.sql`:
-  ```sql
-  CREATE TABLE IF NOT EXISTS iocs (
-    type     TEXT NOT NULL,
-    value    TEXT NOT NULL,
-    source   TEXT NOT NULL,
-    score    SMALLINT NOT NULL CHECK (score BETWEEN 0 AND 100),
-    added_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (type, value),
-    CHECK (type IN ('ip','domain','sha256'))
-  );
-  ```
-- [ ] `manifests/postgres/seed-job.yaml` — Job runs `iocheck:dev` image with `bun run scripts/seed.ts`; uses `ON CONFLICT (type, value) DO NOTHING`; idempotent; backoffLimit 3
-- [ ] `scripts/seed.ts` — generates 10 000 synthetic IOCs: 100 "hot" with deterministic values + 9 900 "cold". Hot set must overlap with k6's request distribution for the cache-hit story
-- [ ] `manifests/redis/deployment.yaml` — `redis:7.4-alpine`, args `--maxmemory 256mb --maxmemory-policy allkeys-lru --save ""` (ephemeral by design)
-
-**Checks:** `kubectl apply -k manifests/` brings the stack up green; logs/probes clean; one curl through NodePort succeeds.
+`kind-config.yaml` is 3 workers + 1 control-plane with one `extraPortMappings`
+for the iocheck NodePort. iocheck Deployment runs `iocheck:dev` with
+`imagePullPolicy: IfNotPresent`, the calibrated 300m/128Mi requests +
+1000m/256Mi limits, all three probe types, and pod anti-affinity (preferred,
+hostname topology) so replicas spread across the 3 workers — that's
+challenge #2 ("make sure pods share load"). PDB sets `minAvailable: 2`.
+ServiceMonitor scrapes `/metrics` every 10s. Postgres StatefulSet uses
+`postgres:17-alpine`, 2Gi PVC on kind's local-path provisioner,
+`max_connections=200` (worst-case 8 pods × 10 pool = 80 conns + headroom).
+The schema is in an init ConfigMap. Seed Job is idempotent
+(`ON CONFLICT (type, value) DO NOTHING`). Redis is `redis:7.4-alpine` with
+`--maxmemory 256mb --maxmemory-policy allkeys-lru --save ""` (ephemeral by
+design — cache reconstructible from Postgres).
 
 ### Phase E — Observability (Prometheus + Grafana)
 
-Files: `manifests/monitoring/kube-prometheus/` (vendored from upstream v0.17.0), `manifests/monitoring/patches/prometheus-cr.yaml`, `manifests/monitoring/grafana-dashboard-configmap.yaml`
+Files: `manifests/monitoring/{grafana-config,prometheus-cr-patch,prometheus-netpol-patch,prometheus-rbac-iocheck}.yaml`,
+`dashboards/iocheck.json`
 
-- [ ] Vendor `kube-prometheus` v0.17.0 `manifests/setup/` and `manifests/` into `manifests/monitoring/kube-prometheus/`; pin commit SHA in a README inside the dir
-- [ ] Strip alertmanager and blackbox-exporter manifests (RAM budget)
-- [ ] Patch Prometheus CR: `enableRemoteWriteReceiver: true`, `retention: 6h`, requests `cpu: 100m, memory: 400Mi`, limits `memory: 1Gi`, `replicas: 1`
-- [ ] Drop Grafana to 1 replica; default admin password via Secret; ConfigMap with one pre-built dashboard JSON: replica count, RPS, p95/p99, CPU utilization, in-flight, cache hit rate
-- [ ] Label `iocheck` namespace so the operator's `serviceMonitorNamespaceSelector` matches
+kube-prometheus v0.17.0 is `git clone`d into `.bin/` at `make up` time and
+applied directly (alertmanager + blackbox stripped to fit RAM). Prometheus
+CR is patched via `kubectl patch --type=merge` to enable
+`remoteWriteReceiver`, drop retention to 6h, and shrink resources.
+NetworkPolicy is patched so KEDA and the loadtest namespace can reach
+Prometheus. Grafana is reconfigured for anonymous Admin access (no login
+wall) with the iocheck dashboard set as the home page. The dashboard is
+auto-imported by the Makefile.
 
-**Checks:** `kubectl port-forward svc/prometheus-k8s -n monitoring 9090:9090` → query `http_requests_total{service="iocheck"}` returns series; Grafana dashboard renders.
+### Phase F — KEDA autoscaling (Kustomize overlays)
 
-### Phase F — KEDA autoscaling (two scenarios, Kustomize overlays)
+Files: `manifests/overlays/{cpu-hpa,rps-hpa-4,rps-hpa-8}/{kustomization,scaledobject}.yaml`
 
-Files: `manifests/keda/keda-2.19.0.yaml` (vendored), `manifests/overlays/cpu-hpa/scaledobject.yaml`, `manifests/overlays/rps-hpa/scaledobject.yaml`, `manifests/overlays/{cpu-hpa,rps-hpa}/kustomization.yaml`
+KEDA `keda-2.19.0.yaml` is applied at `make up` time. Three wired overlays:
 
-- [ ] Vendor KEDA `keda-2.19.0.yaml` (commit SHA pinned)
-- [ ] **Overlay `cpu-hpa/`** — ScaledObject Scenario A (the "bad" one): `cpu` trigger type, `metricType: Utilization`, `value: "70"`, min 2 max 10, scaleDown stabilization 120s
-- [ ] **Overlay `rps-hpa/`** — ScaledObject Scenario B (the "good" one): `prometheus` trigger, query `sum(rate(http_requests_total{service="iocheck"}[1m]))`, `metricType: AverageValue`, threshold `"100"` (target 100 RPS/pod), `activationThreshold: "5"`, scaleDown stabilization 120s, **`fallback: {failureThreshold: 3, replicas: 4, behavior: static}`** (covers "Prometheus down" question in the writeup)
-- [ ] Inline comment in each ScaledObject explaining the AverageValue/HPA divide-by-replicas gotcha
-- [ ] Kustomize base under `manifests/iocheck/`; overlays compose base + ScaledObject
+- **`cpu-hpa/`** — Scenario A, the "bad" autoscaler from EXERCISE.md.
+  `cpu` trigger, `metricType: Utilization`, `value: "70"` (70% of request),
+  min=2 max=8 (matches the EXERCISE.md prompt's exact baseline), no fallback
+  (CPU is in-cluster). This overlay exists to make the failure mode
+  *visible* — at our cache-heavy workload, CPU peaks at ~50–60% of request
+  even during a 10× burst, so the HPA never fires.
+- **`rps-hpa-4/`** — Scenario B-tight. Prometheus trigger, query
+  `sum(rate(http_requests_total{service="iocheck"}[1m]))`,
+  `metricType: AverageValue`, `threshold: "100"` (target 100 RPS/pod), min=2
+  max=4 (tight horizontal ceiling), `fallback: {failureThreshold: 3,
+  replicas: 3, behavior: currentReplicasIfHigher}`.
+- **`rps-hpa-8/`** — Scenario B-moderate. Same as rps-hpa-4 but max=8 and
+  fallback replicas=4. This is also the overlay used by `bench-failure`.
 
-**Checks:**
-- Apply `cpu-hpa` overlay → `kubectl get hpa -n iocheck` shows HPA targeting CPU 70%
-- Apply `rps-hpa` overlay → `kubectl get scaledobject` `READY=True`, `ACTIVE=False` at rest
+Inline comments in each ScaledObject explain the AverageValue/HPA
+divide-by-replicas gotcha. Kustomize base under `manifests/iocheck/`;
+overlays compose base + ScaledObject.
 
 ### Phase G — Load test (k6 in-cluster)
 
-Files: `loadtest/script.js`, `loadtest/job.yaml`, `loadtest/configmap.yaml`
+Files: `loadtest/{script.js,configmap.yaml,job.yaml}`
 
-- [ ] `loadtest/script.js` — `ramping-arrival-rate` executor: stages 60s→100, 4m→1000, 5m→0; `preAllocatedVUs: 200`, `maxVUs: 500`; thresholds `http_req_failed: ['rate<0.01']`, `http_req_duration: ['p(99)<200']`
-- [ ] Request body: random pick from a list of 100 hot IOCs (90% of traffic) + 900 cold IOCs (10%, exercises miss path). List must be a subset of seeded values
-- [ ] `loadtest/configmap.yaml` mounts `script.js`
-- [ ] `loadtest/job.yaml` — `grafana/k6:2.0.0`, args include `--out=experimental-prometheus-rw`, `K6_PROMETHEUS_RW_SERVER_URL=http://prometheus-k8s.monitoring.svc:9090/api/v1/write`, `--tag testid=...`
-- [ ] Run with `kubectl create -f loadtest/job.yaml --dry-run=client -o yaml | kubectl apply -f -` (re-creatable name) or generate unique name per run
-
-**Checks:** Job runs, k6 stdout shows ramp, Prometheus has `k6_*` series, Grafana panel shows the curve.
+`loadtest/script.js` uses `ramping-arrival-rate` (open model) with stages
+30s ramp → 90s sustain → 30s drain at the configured TARGET_RPS. Default
+distribution is 80% miss / 20% hot keys (`MISS_RATE=0.8`); both pools
+overlap with seeded IOCs so cache-hit accounting is honest. Thresholds:
+`http_req_failed: ['rate<0.01']`, `http_req_duration: ['p(99)<200']`. k6
+runs 4 parallel pods (one per worker plus control-plane) so its own CPU
+doesn't bottleneck the load. Metrics push via
+`--out=experimental-prometheus-rw` to the in-cluster Prometheus.
 
 ### Phase H — Makefile + reproducibility
 
-Files: `Makefile`, `README.md`
+Files: `Makefile`, `scripts/{bootstrap.sh,seed.ts,capture.ts,compare.ts}`,
+`README.md`
 
-- [ ] `Makefile` targets:
-  - `make help` — list targets with one-liners
-  - `make tools-check` — verify `docker`, `kind`, `kubectl` present; print versions; **no auto-install** (assessor controls their env)
-  - `make up` — `kind create cluster --config kind-config.yaml`; load `iocheck:dev`; apply KEDA, monitoring, namespace, postgres, redis, seed-job, iocheck (base); wait for rollouts; print access URLs
-  - `make down` — `kind delete cluster --name iocheck`
-  - `make build` — `docker build -t iocheck:dev .` + `kind load docker-image iocheck:dev`
-  - `make rebuild` — `make build && kubectl rollout restart deployment/iocheck -n iocheck`
-  - `make scenario-cpu` — `kubectl apply -k manifests/overlays/cpu-hpa/`; `kubectl delete -k manifests/overlays/rps-hpa/ --ignore-not-found`
-  - `make scenario-rps` — inverse
-  - `make load` — `kubectl create -f loadtest/job.yaml`
-  - `make load-stop` — `kubectl delete job/k6-load -n iocheck --ignore-not-found`
-  - `make watch` — `watch -n 1 'kubectl get pods,hpa,scaledobject -n iocheck && echo && kubectl top pods -n iocheck 2>/dev/null'`
-  - `make grafana` — port-forward + open browser
-  - `make logs` — `kubectl logs -l app=iocheck -n iocheck --tail=100 -f`
-- [ ] `README.md`:
-  - Prereqs (Docker ≥ 24, kind ≥ 0.31, kubectl ≥ 1.32; mention Bun is optional for host dev)
-  - One-shot quickstart: `make up && make scenario-rps && make load`
-  - Walkthrough script for the 30-min demo (six commands, expected outputs)
-  - Troubleshooting table (kind RAM, image not loaded, KEDA not scaling)
-  - Pointer to WRITEUP.md and `logs/` (AI transcripts)
+Assessor surface = **7 Make targets**:
+- `make up` — `kind create cluster`, load image, install KEDA +
+  kube-prometheus, apply iocheck stack, run seed Job, import dashboard
+- `make down` — destroy cluster + `.bin/`, keep `artifacts/`
+- `make bench-cpu` — CPU-HPA scenario + load + capture
+- `make bench-rps4` — RPS-HPA (max=4) + load + capture
+- `make bench-rps8` — RPS-HPA (max=8) + load + capture
+- `make bench-failure` — RPS-HPA + Prometheus blackout @ T+75s for 90s
+  (writeup §4 fallback validation)
+- `make bench-all` — runs cpu / rps4 / rps8 sequentially under a single
+  `artifacts/bench-all-<ts>/` root and emits `comparison.md`. Excludes
+  `bench-failure` (different question). Continue-on-failure, non-zero
+  exit if any sub-bench failed. See `bench-all-plan.md` for design.
 
-**Checks:** `make down && make up` on a clean machine completes in < 6 min; all probes green; `make scenario-rps && make load` produces visible scale-up within 60s.
+All `bench-*` targets default to `MISS_RATE=0.8`, `TARGET_RPS=1000`.
+`scripts/capture.ts` polls Prometheus + the KEDA HPA's `ScalingActive`
+condition every 5s and writes `state.csv`, `prometheus-snapshots.json`,
+`hpa-events.txt`, `summary.md`, and `summary.json` (the last is what
+`compare.ts` aggregates). Capture is SIGTERM-safe — partial bench data is
+recoverable.
 
 ### Phase I — Writeup
 
-Files: `WRITEUP.md`
+Files: `WRITEUP.md` (~1–2 pages, markdown). User maintains by hand.
 
-- [ ] ~1–2 pages, markdown. Structure:
-  1. **Architecture** — diagram + 1 paragraph
-  2. **Challenge 1 — Why CPU-based HPA is wrong:** Grafana screenshot showing CPU < 60% while p99 > 1 s; explanation that I/O-bound cache-hit traffic does not move CPU enough to trigger 70%; bottleneck is event-loop + DB pool concurrency
-  3. **Challenge 2 — Pod load sharing:** pod anti-affinity spreads replicas across kind workers; k6 runs in-cluster against ClusterIP so kube-proxy round-robins; show `kubectl logs` request counts per pod balanced within ±10%
-  4. **Challenge 3 — Autoscaler that scales up and down:** KEDA Prometheus trigger on `sum(rate(http_requests_total))`, `metricType: AverageValue`, threshold 100 RPS/pod, `scaleDown.stabilizationWindowSeconds: 120`. Show 2 → 10 → 2 sequence
-  5. **Challenge 4 — Reproducible test:** `make scenario-rps && make load`; Grafana panel timeline
-  6. **What happens if the autoscaler's data source is unavailable:** KEDA `fallback.replicas: 4, behavior: static` pins to a sane mid-load count; PrometheusRule alerts when fallback engages
-  7. **What I'd do differently with another week:** CloudNativePG for HA Postgres + PgBouncer; distroless compiled-binary image; in-flight-requests metric as primary signal (RPS is intuitive but in-flight is causally closer to saturation); OpenTelemetry tracing; signed images + admission policies; real auth on `/ioc` (mTLS or OIDC)
-- [ ] Inline Grafana screenshots (saved to `WRITEUP_assets/`)
+### Phase J — Demo dry-run
 
-### Phase J — Demo dry-run + capture
-
-- [ ] Full clean run: `make down && make up && make scenario-cpu && make load`; wait full cycle; capture Grafana screenshot of "CPU < 70%, replicas flat at 2, p99 wall" (Challenge 1 evidence)
-- [ ] `make scenario-rps && make load` again; capture "2 → ~10, p99 < 200ms"; capture scale-down to 2
-- [ ] Verify all four challenges visibly demonstrable
-- [ ] Confirm `logs/` directory contains AI transcripts for the AI-chat-logs deliverable
+`make down && make up && make bench-cpu && make bench-rps8 && make bench-failure`
+produces a visible CPU-never-scales artifact, a clean 2 → up → 2 RPS
+trajectory, and a fallback fire moment captured in `summary.md`. Each
+bench writes its own artifact dir; `bench-all` produces a side-by-side
+`comparison.md`.
 
 ---
 
 ## Edge cases & error handling
 
-- **Prometheus down** → KEDA `fallback.replicas: 4, behavior: static` (covered in writeup)
-- **Postgres pool exhaustion** at scale → Bun.sql `max: 10` × max 10 pods = 100 conns; raise Postgres `max_connections` to 200 in StatefulSet args for headroom
-- **Redis down** → readyz fails (per EXERCISE.md spec). Service stops receiving traffic; cleanly recovers when Redis returns. Don't degrade to "DB-only mode" — that's a silent SLA breach
-- **Bun idleTimeout** → raised to 30s so slow miss-path queries don't reset connections under burst
-- **SIGTERM** → drain pattern (readyz=false → sleep 5s → server.stop → pool close → exit). `terminationGracePeriodSeconds: 30` covers it
-- **kind RAM budget** → strip alertmanager + blackbox-exporter; Prometheus retention=6h, replicas=1
-- **Image not loaded into kind** → explicit `iocheck:dev` tag, `imagePullPolicy: IfNotPresent`, `make build` always runs `kind load docker-image`
-- **KEDA AverageValue / replica-divide gotcha** → PromQL returns cluster-total; inline comment in YAML
-- **`/ioc` auth** → shared `X-Admin-Token`; 401 on missing/wrong; deliberately not exposing existence
-- **Seed Job concurrency** → `ON CONFLICT (type, value) DO NOTHING`; idempotent across reruns
-- **Cache poisoning on upsert** → `cache.del` immediately after successful DB upsert; eventual consistency window is the gap between DB commit and Redis DEL (one network hop)
-- **Negative cache for unknown IOCs** → short TTL (60s) tombstone to absorb miss-path bursts on the same unknown value; expires fast enough not to mask a fresh upsert
-- **`/lookup` body validation** → reject anything that isn't the documented shape with 400; missing `type` or unrecognized type returns 400 (don't 500 on bad input)
+- **Prometheus down** → KEDA `fallback.replicas: {3 for rps-hpa-4, 4 for
+  rps-hpa-8}, behavior: currentReplicasIfHigher`. The `currentReplicasIfHigher`
+  setting is critical: plain `static` would *shrink* the deployment to the
+  fallback count if Prometheus dies during a burst, which is the opposite of
+  what you want.
+- **Postgres pool exhaustion** at scale → `PG_POOL_MAX=10` × 8 pods = 80
+  conns; Postgres `max_connections=200` covers app + monitoring + admin
+- **Redis down** → readyz fails (per EXERCISE.md spec). Service stops
+  receiving traffic; cleanly recovers when Redis returns. We deliberately
+  don't degrade to "DB-only mode" — that would be a silent SLA breach
+- **Bun idleTimeout** → raised to 30s so slow miss-path queries don't reset
+  connections under burst
+- **SIGTERM** → drain pattern (readyz=false → sleep 5s → server.stop → pool
+  close → exit). `terminationGracePeriodSeconds: 30` covers it
+- **kind RAM budget** → strip alertmanager + blackbox-exporter; Prometheus
+  retention=6h, replicas=1
+- **Image not loaded into kind** → explicit `iocheck:dev` tag,
+  `imagePullPolicy: IfNotPresent`, `make up` always runs `kind load docker-image`
+- **KEDA AverageValue / replica-divide gotcha** → PromQL returns
+  cluster-total; inline comment in YAML
+- **`/ioc` auth** → shared `X-Admin-Token`; 401 on missing/wrong; deliberately
+  not exposing existence
+- **Seed Job concurrency** → `ON CONFLICT (type, value) DO NOTHING`;
+  idempotent across reruns
+- **Cache poisoning on upsert** → `cache.del` immediately after successful DB
+  upsert; eventual consistency window is the gap between DB commit and Redis
+  DEL (one network hop)
+- **Negative cache for unknown IOCs** → short TTL (60s) tombstone to absorb
+  miss-path bursts on the same unknown value; expires fast enough not to
+  mask a fresh upsert
+- **`/lookup` body validation** → reject anything that isn't the documented
+  shape with 400; missing `type` or unrecognized type returns 400 (don't 500
+  on bad input)
 
 ---
 
-## Risks & open questions
+## Risks & open questions (resolution status)
 
-1. **CPU calibration is empirical.** The per-cache-hit CPU estimate (~0.3 ms) drives the "CPU stays under 70%" claim. After Phase A, run a 60s flat-rate load test (single pod, no HPA) and **measure** CPU/RPS. If actual is much higher (e.g. cache-hit costs 1 ms instead of 0.3), the 300m request might let CPU sneak above 70% under burst — re-tune by raising the request to 400–500m. Locking this in is a Phase J task.
-2. **kind RAM ceiling on a laptop.** Full stack worst case: 1 cp + 3 workers + Postgres + Redis + 10× iocheck + Prometheus + Grafana + KEDA + node-exporter + k6 Job. Estimate: 4–6 GB RAM. If too tight on the target machine, drop to 2 workers (still demonstrates anti-affinity).
-3. **Bun.sql sharp edges.** None of the documented limitations (no LISTEN/NOTIFY, BIGINT-as-string, no name transform) bite this exercise. Risk: undocumented edge in a 1.3.x point release. Mitigation: keep `porsager/postgres` as a one-import swap.
-4. **HPA scale-down stabilization tuning.** Default 300s is too slow for a 5-min demo. `120s` is the planned value but may need to drop to 60s if the drain segment runs out of room. Verify in Phase J.
-5. **k6 push to Prometheus.** Requires `enableRemoteWriteReceiver: true` on the Prometheus CR. Silent failure if omitted. Verify in Phase E.
-6. **In-cluster k6 hits ClusterIP; per-pod balance depends on kube-proxy iptables hashing.** Should be within ±10% but not perfect. If a worse split shows, switch the Service to `internalTrafficPolicy: Cluster` (default) and ensure k6 has many concurrent VUs (open-model executor does).
-7. **30-min walkthrough timing.** Full cycle (cluster up → scenario A → scenario B → tear down) is tight. Pre-warm: run `make up` before the call; do scenarios live.
+1. **CPU calibration** (RESOLVED) — measured ~0.12 ms/hit, lower than
+   estimated. CPU stays well under 70% during bursts; "wrong signal"
+   narrative holds even more strongly than expected.
+2. **kind RAM ceiling on a laptop** (RESOLVED) — 3 workers + full stack
+   fits within 4–6 GB. Stripped alertmanager and blackbox to make headroom.
+3. **Bun.sql sharp edges** (RESOLVED) — none bit this exercise. Kept
+   `porsager/postgres` as a one-import swap, never needed.
+4. **HPA scale-down stabilization tuning** (RESOLVED) — settled at 60s
+   stabilization + 25%/60s policy. Drains a full burst back to min=2 inside
+   the 120s post-observe window.
+5. **k6 push to Prometheus** (RESOLVED) — `enableRemoteWriteReceiver: true`
+   patch on the Prometheus CR; verified in artifacts.
+6. **Per-pod load balance** (RESOLVED) — k6 ClusterIP traffic distributes
+   within ±10% across pods (verified via per-pod `http_requests_total`).
+7. **30-min walkthrough timing** (RESOLVED) — `make up` ~6 min;
+   `bench-rps8` ~5 min; total fits a live demo with margin. Pre-warm `up`
+   before the call.
 
 ---
 
 ## Build Log
 
-**2026-05-12** — implementation complete; Status: **COMPLETE**.
+**2026-05-12** — initial implementation. Service, tests, Docker, k8s
+manifests, kube-prometheus, KEDA, k6, Makefile, README, WRITEUP all built
+and verified end-to-end.
 
-### What landed
-- Phases A–J all done. Service, tests, Docker, k8s manifests, kube-prometheus,
-  KEDA, k6 load test, Makefile, README, and WRITEUP. Bench artifacts are
-  regenerated per run under `artifacts/<scenario>-<mode>-<ts>/`.
-- Assessor surface = 4 Make targets (`up`, `bench-cpu`, `bench-rps`, `down`).
-  Confirmed end-to-end on a fresh cluster: `make up` (~6 min), bench-cpu and
-  bench-rps each run a 5-min profile and write an artifact directory.
+**2026-05-13** — bench harness evolution. Added the four-way bench grid
+(`bench-cpu`, `bench-rps4`, `bench-rps8`, `bench-failure`) replacing the
+original single `bench-rps` target; tightened the k6 profile from 10 min
+to ~5 min; switched KEDA fallback from `static` to
+`currentReplicasIfHigher`; added `bench-all` aggregator (separate plan
+doc: `bench-all-plan.md`).
 
-### Deviations from the plan
-- **kind extraPortMappings for Prometheus + Grafana removed** (Phase D). Docker
-  binds the host port the moment the container starts even without a matching
-  NodePort Service, shadowing `kubectl port-forward` binds. Kept the iocheck
-  NodePort 30080→8080 mapping; Grafana + Prometheus access goes via Makefile
-  port-forwards.
-- **Prometheus `serviceMonitorNamespaceSelector` is `{}` not label-restricted.**
-  An earlier draft restricted to `monitoring=true`, which excluded the
-  `monitoring` namespace itself and silently broke kubelet/cadvisor scraping
-  (and thus CPU-based HPA). Made the selector empty; the iocheck namespace's
-  monitoring label remains as a marker, no longer load-bearing.
-- **Prometheus NetworkPolicy patched** (`manifests/monitoring/prometheus-netpol-patch.yaml`).
-  Upstream kube-prometheus allows only Grafana + adapter ingress. Extended to
-  permit the `keda` namespace (autoscaler queries) and any namespace labelled
-  `monitoring=true` (k6 remote-write push).
-- **Prometheus CR patch via `kubectl patch --type=merge`, not `apply -f`**
-  (Phase E). `apply -f` clobbers `podMetadata.labels` because the
+### Notable deviations from the original plan
+- **`extraPortMappings` for Prometheus + Grafana removed.** Docker binds
+  the host port the moment the container starts even without a matching
+  NodePort Service, shadowing `kubectl port-forward` binds. Kept the
+  iocheck NodePort 30080→8080 mapping; Grafana + Prometheus access goes
+  via Makefile port-forwards.
+- **Prometheus `serviceMonitorNamespaceSelector` is `{}`, not
+  label-restricted.** An earlier draft restricted to `monitoring=true`,
+  which excluded the `monitoring` namespace itself and silently broke
+  kubelet/cadvisor scraping (and thus CPU-based HPA). Made the selector
+  empty.
+- **Prometheus NetworkPolicy patched** (`prometheus-netpol-patch.yaml`).
+  Upstream kube-prometheus allows only Grafana + adapter ingress.
+  Extended to permit the `keda` namespace (autoscaler queries) and the
+  loadtest namespace (k6 remote-write push).
+- **Prometheus CR patch via `kubectl patch --type=merge`, not `apply -f`.**
+  `apply -f` clobbers `podMetadata.labels` because the
   last-applied-config replaces the entire spec; the operator then can't
   populate the Service selector and the Service has zero endpoints.
-- **prometheus-operator rollout restart in `.stack`** (Phase D). The operator
-  caches the namespace list; without a forced re-sync after iocheck namespace
+- **prometheus-operator rollout restart in `.stack`.** The operator caches
+  the namespace list; without a forced re-sync after iocheck namespace
   creation, the iocheck ServiceMonitor never produces a scrape job.
-- **Seed Job env-var ordering** (Phase D). `$(PGPASSWORD)` substitution in
-  `DATABASE_URL` requires PGPASSWORD to be declared *before* DATABASE_URL in
-  the env list — k8s only substitutes from prior entries.
-- **Makefile inline `#` comments removed inside the bench heredoc** (Phase H).
+- **Seed Job env-var ordering.** `$(PGPASSWORD)` substitution in
+  `DATABASE_URL` requires PGPASSWORD to be declared *before* DATABASE_URL
+  in the env list — k8s only substitutes from prior entries.
+- **Makefile inline `#` comments removed inside the bench heredoc.**
   A `# comment \` after a chained shell command swallowed the rest of the
-  bench cleanup section (capture script SIGTERM, summary banner) because
-  make joins recipe lines into one shell string before the shell sees them.
-- **CPU per-request cost was overestimated** (Risk #1 in original plan).
-  Measured ~0.12 ms/hit, not 0.3 ms. Result: at 478 RPS/pod, peak CPU is
-  20% of request — far below the 70% HPA threshold. The "wrong signal"
-  narrative still holds (CPU never moves) but the "p99 walls" narrative
-  doesn't materialise at this calibration; p99 stays < 20 ms in both
-  scenarios. WRITEUP reframes accordingly.
-
-### Reference bench numbers (representative run, hot-mix workload)
-- **bench-cpu**: peak RPS 956.2, peak CPU 20.2%, replicas held at 2, peak p99
-  5 ms. HPA never fired (CPU < 70%).
-- **bench-rps**: peak RPS 956.7, replicas climbed 2 → 9 → 3 within the window,
-  peak p99 16 ms. KEDA reading `sum(rate(http_requests_total{service="iocheck"}[1m]))`,
-  threshold 100 RPS/pod, fallback.replicas=4.
+  bench cleanup section because make joins recipe lines into one shell
+  string before the shell sees them.
+- **Postgres CPU bumped from 200m to 1000m.** At 200m, Postgres got
+  starved on cpu.shares by iocheck pods on the same kind worker; bumped
+  to give it real scheduling priority.
+- **Redis CPU bumped from 50m to 500m + 2000m limit.** Same root cause —
+  single-threaded Redis was being descheduled under pod contention,
+  showing 10–60ms ops in slowlog.
 
 ## Summary
 
-Completed: 2026-05-12
-
-Files created/modified: ~40 — `src/*.ts`, `tests/*.test.ts`, `scripts/*`,
-`manifests/{namespace,iocheck/*,postgres/*,redis/*,monitoring/*,overlays/*}`,
-`loadtest/{script.js,job.yaml,configmap.yaml}`, `Dockerfile`,
-`docker-compose.yml`, `kind-config.yaml`, `Makefile`, `README.md`, `WRITEUP.md`,
-`dashboards/iocheck.json`. Bench artifacts are generated per run under
-`artifacts/<scenario>-<mode>-<ts>/` and are not committed.
+Files created/modified: ~50 across `src/`, `tests/`, `scripts/`,
+`manifests/`, `loadtest/`, `dashboards/`, plus the top-level
+`Dockerfile`, `docker-compose.yml`, `kind-config.yaml`, `Makefile`,
+`README.md`, `WRITEUP.md`. Bench artifacts are generated per run under
+`artifacts/<scenario>-<mode>-<ts>/` (or `artifacts/bench-all-<ts>/<scenario>/`
+when run via `bench-all`) and are not committed.
 
 Key decisions worth recalling:
 - Bun.serve + Bun.sql + Bun.redis (no external drivers).
 - KEDA + Prometheus over prometheus-adapter for the autoscaler.
-- kube-prometheus v0.17.0 vendored at make-up time (git clone into `.bin/`).
+- kube-prometheus v0.17.0 vendored at `make up` time (git clone into
+  `.bin/`).
 - Bench captures via `scripts/capture.ts`: replica trajectory CSV, PromQL
-  snapshots, summary.md, HPA describe — all written on capture's SIGTERM
-  handler so partial bench data is recoverable.
-
-Deviations from plan: see Build Log above. None of them changed the
-end-to-end deliverable shape, only intermediate fixes.
-
+  snapshots, summary.md, summary.json, HPA describe — all written on
+  capture's SIGTERM handler so partial bench data is recoverable.
+- KEDA `fallback.behavior: currentReplicasIfHigher` so a Prometheus blackout
+  during a burst doesn't shrink the deployment.
