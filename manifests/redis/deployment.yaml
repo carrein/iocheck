@@ -52,5 +52,12 @@ spec:
             timeoutSeconds: 2
             failureThreshold: 6
           resources:
-            requests: { cpu: 50m, memory: 64Mi }
-            limits: { memory: 384Mi }
+            # Redis is single-threaded — every µs of CPU loss extends
+            # wall-clock for the op holding the thread. At 50m we saw
+            # GET/SETs sitting in slowlog at 10–60ms because the kernel
+            # was descheduling Redis under contention from iocheck pods on
+            # the same kind worker. 500m gives Redis real scheduling
+            # weight; the 2000m limit lets it burst into spare host
+            # capacity for tail-latency smoothing without going unbounded.
+            requests: { cpu: 500m, memory: 64Mi }
+            limits: { cpu: 2000m, memory: 384Mi }

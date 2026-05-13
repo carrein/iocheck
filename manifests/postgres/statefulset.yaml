@@ -28,8 +28,9 @@ spec:
       containers:
         - name: postgres
           image: postgres:17-alpine
-          # Bump max_connections to 200 so we can scale to 10 pods * 10 pool = 100
-          # without contention from monitoring + admin consumers.
+          # max_connections=200 leaves 2× headroom over the worst-case app
+          # demand (8 iocheck pods × PG_POOL_MAX=10 = 80 conns) and absorbs
+          # monitoring + admin consumers without contention.
           args: ["-c", "max_connections=200", "-c", "shared_buffers=128MB"]
           env:
             - { name: POSTGRES_DB, value: iocheck }
@@ -50,7 +51,11 @@ spec:
             timeoutSeconds: 2
             failureThreshold: 6
           resources:
-            requests: { cpu: 200m, memory: 512Mi }
+            # At 200m Postgres got starved on cpu.shares by the iocheck pods
+            # on the same kind worker (peak demand = 8 × 300m = 2400m).
+            # 1000m gives Postgres real scheduling priority. Memory covers
+            # shared_buffers (128Mi) + working memory headroom.
+            requests: { cpu: 1000m, memory: 512Mi }
             limits: { memory: 1Gi }
           volumeMounts:
             - { name: data, mountPath: /var/lib/postgresql/data }
